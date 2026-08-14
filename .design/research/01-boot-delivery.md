@@ -30,7 +30,7 @@ Chain: reset → `boot0` (mask ROM root of trust) → `boot1` (USB bootloader) �
 - `boot1` validates the `baremetal`/`loader` slot (`bao1x-boot/boot1/src/secboot.rs:61-63`), disables
   all IRQs (`bao1x-boot/boot1/src/secboot.rs:86`), seals its key slots (`.../secboot.rs:122`), and jumps
   (`.../secboot.rs:127`). boot1 hosts a USB MSC (FAT32, volume label `BAOCHIP`, `ALTCHIP` when running
-  alt-boot1 — `README-baochip.md:46-52`) plus a CDC-ACM USB serial console and a 1 Mbaud DUART console
+  alt-boot1 — `README-baochip.md:46-52`) plus CDC-ACM USB and 1 Mbaud UDMA UART2 serial consoles
   on PB13/PB14 (`README-baochip.md:27-28`, `README-consoles.md:5-16`). It has a command REPL (see §4).
 - `baremetal` = "unsecured, bare-iron environment, no_std, alloc pre-initialized, USB serial console"
   (`README-baochip.md:59`). `loader` is the same slot blossoming into Xous: it unpacks kernel+init
@@ -175,7 +175,7 @@ MEMORY { FLASH : ORIGIN = 0x60060400, LENGTH = 256k - 1024
 | mtvec | Points at boot1's `abort` | `bao1x-boot/boot1/src/asm.rs:16-18` |
 | MMU/caches | satp untouched (off); no explicit cache flush/disable in boot1 (loader only fences at MMU enable) | `loader/src/asm.rs:285-295` |
 | Clocks | boot0 sets conservative clocks incl. DUART (`bao1x-boot/boot0/src/platform/bao1x/bao1x.rs:81-107`, `:142`); boot1 re-inits fclk = 700 MHz ⇒ CPU 350 MHz, perclk 100 MHz at jump | `bao1x-boot/boot1/src/platform/bao1x/bao1x.rs:468-488`, `:514`; `offsets/dabao.rs:31` |
-| DUART console | Live at 0x40042000, 1 Mbaud 8N1, PB14=TX/PB13=RX | `utralib .../bao1x.rs:388`; `README-baochip.md:28`; `libs/bao1x-api/src/lib.rs:46` |
+| Serial consoles | UDMA UART2 is live at 1 Mbaud 8N1 on PB14=TX/PB13=RX. The separate TX-only DUART is at 0x40042000, but Dabao leaves its dedicated package pad unconnected | `README-baochip.md:28`; `README-consoles.md:5-16`; `dabao_v3c.kicad_pcb` DUART pad D3; `pad_frame_arm.sv` PAD_DUART |
 | USB | Was MSC+CDC; IRQs now dead; boot1 asserts SE0 low on the normal boot path (next stage should de-assert if it wants USB) | `bao1x-boot/boot1/src/main.rs:386-430`, `repl.rs:152-161` |
 | Watchdog | Off by default (only `oem-baosec-lite` enables WDT when on battery) | `bao1x-boot/boot1/.../bao1x.rs:516-529` |
 | RAM (ACRAM) | Contains boot1 leftovers (stack/heap); only the next stage's own `.data/.bss` are cleared | `bao1x.rs:154-182` (boot1) / `baremetal .../bao1x.rs:60-72` (baremetal) |
@@ -238,17 +238,19 @@ pattern against `uf2`.
   (`bao1x-boot/boot1/src/secboot.rs:43-54`). No OpenOCD/SWD/trace configs exist anywhere in-tree
   (no `*.cfg`/`*.tcl` matches). In sim, the VexRiscv debug module sits at `0xefff0000`
   (`verilate/bao_common.py:101`).
-- **Debug UART**: DUART @ `0x40042000`, PB14 (TX) / PB13 (RX), **1,000,000 baud 8N1** at VDDIO levels
-  (`README-baochip.md:28`; `README-consoles.md:9-16`; `libs/bao1x-api/src/lib.rs:46`). This is the
-  bring-up console boot0 already configures (`bao1x-boot/boot0/.../bao1x.rs:101-107`), so Zephyr gets a
-  working UART for free. USB CDC-ACM is the other console but dies with IRQs disabled at handoff.
+- **Debug UARTs**: UDMA UART2 drives PB14 (TX) / PB13 (RX) at **1,000,000 baud 8N1** and 3.3 V on Dabao
+  (`README-baochip.md:28`; `README-consoles.md:9-16`; `libs/bao1x-api/src/lib.rs:46`). The separate
+  TX-only DUART at `0x40042000` is trivial to drive and visible in Verilator, but its dedicated package
+  pad is unconnected on Dabao (`pad_frame_arm.sv`; `dabao_v3c.kicad_pcb`). USB CDC-ACM dies with IRQs
+  disabled at handoff.
 - Xous itself debugs via prints/consoles + hosted-mode emulation (`baosec-emu`, `README-baochip.md:244-246`).
 
 ## 7. Zephyr boot plan sketch (shortest path)
 
 1. **Zephyr SoC/port**: RV32IMAC M-mode (VexRiscv-class, custom IRQ arrays — e.g. `irqarray5` at
    `0xe0013000`, `timer0` at `0xe001c000`, no CLINT/PLIC — `utralib .../bao1x.rs:360-379`), console on
-   DUART @ `0x40042000` @ 1 Mbaud, tick from `timer0`.
+   DUART @ `0x40042000` for simulation output, polling UDMA UART2 @ `0x50103000` for Dabao output,
+   tick from `timer0`.
 2. **Linker**: ROM `ORIGIN 0x60060400`, `LENGTH ≈ 0x3F800` (leave ~4 KiB headroom at the end for the
    optional 3856-byte PQ signature that is postpended after the payload); RAM `0x61000000`/2 MiB. Ensure
    the reset entry is the first byte of ROM.

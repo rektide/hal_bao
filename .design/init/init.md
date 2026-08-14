@@ -75,16 +75,17 @@ durable copy lives in the shared doc repo, `~/a/doc/bao/`) map the terrain;
    quirk — the first linked instruction must be the reset code, because boot1
    jumps through fixed offsets in a signature block. RAM is ACRAM at
    `0x61000000`. At handoff the machine is in M-mode, MMU off, IRQs masked,
-   at ~350 MHz, with the debug UART already alive at 1 Mbaud.
+   at ~350 MHz, with UDMA UART2 already alive on PB14/PB13 at 1 Mbaud.
 3. **Tooling is the hidden work.** Images are ed25519-signed
    (`xous-sign-image --function-code baremetal`, devkey in slot 3) and wrapped
    in UF2 with family id `0xa7d76373`. The stock Xous packing tool strips
    `.data` (it pokes ≤40 words into RAM) — useless for Zephyr — so we must
    write a packer that embeds `.data` in ROM and lets the kernel self-copy.
 4. **Debug is UART-or-simulation.** JTAG is fused out on production parts.
-   The 1 Mbaud DUART console (boot1 leaves it running) and the verilator RTL
-   simulation — which happily runs arbitrary RV32IMAC images, boot chain
-   bypassed — are the entire debug story.
+   The physical 1 Mbaud UDMA UART2 console and the verilator RTL simulation's
+   TX-only DUART output — which happily runs arbitrary RV32IMAC images, boot
+   chain bypassed — are the entire debug story. Dabao leaves the dedicated
+   DUART package pin unconnected.
 5. **Rust is out (for now), but not wasted.** Zephyr 4.5-dev's Rust story is
    app-level only. The port is all C. But Xous's driver crates are the
    reference implementation for every peripheral, and its utralib register
@@ -118,8 +119,9 @@ durable copy lives in the shared doc repo, `~/a/doc/bao/`) map the terrain;
 - **M1 — boot to main.** SoC skeleton, the `0x60060400` linker layout with
   reset-first linking, the `.data`-capable image packer + devkey signer in
   `tools/`, first UF2 copied to a `BAOCHIP` volume. Exit: early shell.
-- **M2 — a real OS.** DUART poll console, irqarray intc driver, ticktimer
-  sys_clock. Exit: preemptive scheduling demonstrable.
+- **M2 — a real OS.** DUART simulation console, polling UDMA UART2 hardware
+  console, irqarray intc driver, ticktimer sys_clock. Exit: preemptive
+  scheduling demonstrable.
 - **M3 — a board.** `boards/baochip/dabao` HWMv2 tree, IOX GPIO, CMSDK WDT,
   PL031 RTC, button + UART "blinky" (there are no LEDs on a Dabao).
 - **M4 — comms.** UDMA descriptor-DMA subsystem, interrupt-driven UART

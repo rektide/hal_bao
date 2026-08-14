@@ -48,7 +48,7 @@ for non-Xous images — Zephyr's home.
 | D3 | Boot slot | **baremetal region**: ROM `0x60060400`, RAM `0x61000000` (2 MiB) | Xous kernel occupies `0x6009FD00+`; baremetal slot is the intended third-party OS slot (01) |
 | D4 | SoC port model | **Copy `soc/litex/litex_vexriscv` shape**: no CLINT/PLIC required | Same core; bao's intc is even simpler (MMIO ack + custom CSRs MIM/MIP 0xBC0/0xFC0) (00 §4, 02 §1) |
 | D5 | sys_clock | **ticktimer** MMIO driver @ `0xE001_B000` (64-bit, one-shot alarm, IRQ 20) | Machine timer doesn't exist; this is Xous's own kernel clock (00 §3) |
-| D6 | Console | **DUART @ `0x40042000`** poll driver first (boot1 leaves it live @1 Mbaud on PB14/PB13); UDMA UART2 interrupt driver second | Fastest path to printf; UDMA is descriptor-DMA custom IP (00 §5, 01 §3) |
+| D6 | Console | **DUART @ `0x40042000` for simulation**, minimal polling **UDMA UART2 @ `0x50103000` for Dabao hardware**, interrupt-driven UDMA second | DUART is TX-only and easy in Verilator, but Dabao leaves its dedicated package pad unconnected. PB14/PB13 are UDMA UART2 at 1 Mbaud (00 §3.2) |
 | D7 | Flashing | **UF2 runner** with `CONFIG_BUILD_OUTPUT_UF2_FAMILY_ID=0xa7d76373`; devkey signing via `xous-sign-image --bao1x --with-jump --sig-length 768 --function-code baremetal --loader-key devkey/dev.key` | Runner is family-agnostic; copies to any `INFO_UF2.TXT` MSC mount (02 §4, 01 §4) |
 | D8 | CI/emulation | **Verilator RTL sim** (runs arbitrary RV32IMAC, chain bypassed) + later Renode platform if worthwhile | No Renode bao1x platform exists today (01 §8) |
 | D9 | Blinky | **UART + button** (no LEDs on Dabao); GPIO toggle on header pads via IOX | 00 §7 |
@@ -67,7 +67,7 @@ for non-Xous images — Zephyr's home.
 - Sign + UF2 + copy to `BAOCHIP` volume → PROG. Target: `zephyr-entry` / early shell.
 
 ### M2 — console + clock (a real OS)
-- DUART poll console driver (out-of-tree-testable format: reuse reg names from utralib `DUART` block).
+- DUART poll console for Verilator plus a minimal polling UDMA UART2 console for observable Dabao output; full interrupt-driven UDMA remains M4.
 - intc driver: irqarray banks + MIM/MIP custom CSRs; validate edge-vs-level ack semantics against Xous kernel usage (risk R3).
 - ticktimer sys_clock driver (one-shot alarm model per `xous-ticktimer` impl).
 
@@ -95,7 +95,7 @@ for non-Xous images — Zephyr's home.
 | R1 | `.data` packer gap (xous-copy-object strips it) | High | Write custom packer in M1; verify with `readelf` + sim |
 | R2 | ROM budget: baremetal slot ≈ 254 KiB before Xous kernel @`0x6009FD00` | Medium | Watch size; if tight, negotiate slot layout w/ boot1 config or trim features; RRAM XIP so `.data`-in-ROM costs real space |
 | R3 | irqarray edge-vs-level ack semantics undocumented | Medium | Mirror Xous kernel ack sequence exactly; test each bank in sim |
-| R4 | No JTAG on production parts | Medium | 1 Mbaud DUART + verilator sim are the debug story; early-print + sim-first workflow |
+| R4 | No JTAG on production parts | Medium | Physical UDMA UART2 at 1 Mbaud plus Verilator DUART output are the debug story; early-print + sim-first workflow |
 | R5 | Dev-signed image trips DEVELOPER_MODE irreversibly | Low (dev boards) | Use dedicated dev units; note in board docs |
 | R6 | UF2 family id must exactly match boot1 checks (`0xa7d76373`) | Low | Encode in SoC Kconfig.defconfig; smoke test |
 | R7 | Upstream hygiene (vendor prefix, REUSE, checkpatch) | Low | Do it in M0, not retrofit |
