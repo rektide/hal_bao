@@ -18,6 +18,8 @@ is no vendor C SDK. Consequently hal_bao is *not* a classic vendor-HAL mirror li
 - **Tickets and planning** (`.beads/`) for the port effort, tracked as
   `bao-*` issues.
 - **Design docs** (`.design/`) narrating the effort.
+- **Bring-up guides** (`doc/bringup/`) cover artifact validation and hardware
+  recovery procedures.
 
 The Zephyr code itself (SoC port, drivers, devicetree, Dabao board) lives in the
 Zephyr fork at `~/src/zephyr-baochip` — new files only, so it rebases cleanly
@@ -47,6 +49,7 @@ zephyr/        Zephyr module manifest (stub; see module.yml)
   init/       the story of the effort (read first)
   research/   wave-0 research corpus (docs 00–04)
 .beads/        ticket database (bao-* issues)
+doc/bringup/   manual hardware validation and recovery guides
 ```
 
 ## License
