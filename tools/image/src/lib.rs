@@ -8,7 +8,9 @@ use std::{
     str::FromStr,
 };
 
-use bao1x_api::{BAREMETAL_START, JUMP_INSTRUCTION, StaticsInRom, signatures::SIGBLOCK_LEN};
+use bao1x_api::{
+    BAREMETAL_START, JUMP_INSTRUCTION, KERNEL_START, StaticsInRom, signatures::SIGBLOCK_LEN,
+};
 use goblin::elf::{Elf, header::EM_RISCV, program_header::PT_LOAD};
 use xous_semver::SemVer;
 use xous_tools::sign_image::{Version, convert_to_uf2, load_pem, sign_file};
@@ -16,6 +18,7 @@ use xous_tools::sign_image::{Version, convert_to_uf2, load_pem, sign_file};
 pub const BAREMETAL_CODE_ORIGIN: u64 =
     (BAREMETAL_START + SIGBLOCK_LEN + size_of::<StaticsInRom>()) as u64;
 pub const BAREMETAL_CODE_END: u64 = (BAREMETAL_START + 256 * 1024 - 1024) as u64;
+const PQ_SIGNATURE_SIZE: u64 = 3856;
 
 #[derive(Debug)]
 pub struct ImageError(String);
@@ -165,6 +168,9 @@ pub struct SignOptions<'a> {
 }
 
 pub fn sign_image(options: SignOptions<'_>) -> Result<PathBuf, Box<dyn Error>> {
+    if options.input == options.output {
+        return Err(ImageError::new("signed output must differ from the presign input").into());
+    }
     if !matches!(
         options.output.extension().and_then(|value| value.to_str()),
         Some("img" | "bin")
@@ -173,6 +179,17 @@ pub fn sign_image(options: SignOptions<'_>) -> Result<PathBuf, Box<dyn Error>> {
     }
     if options.pq_key.is_some() != options.pq_key_cache.is_some() {
         return Err(ImageError::new("PQ key and key cache must be supplied together").into());
+    }
+    if options.pq_key.is_some() {
+        let signed_size =
+            SIGBLOCK_LEN as u64 + fs::metadata(options.input)?.len() + PQ_SIGNATURE_SIZE;
+        let slot_size = (KERNEL_START - BAREMETAL_START) as u64;
+        if signed_size > slot_size {
+            return Err(ImageError::new(format!(
+                "PQ-signed image is {signed_size} bytes, exceeding the {slot_size}-byte baremetal slot"
+            ))
+            .into());
+        }
     }
 
     let key_path = options
@@ -354,5 +371,44 @@ mod tests {
                 .to_string()
                 .contains("outside the baremetal code slot")
         );
+    }
+
+    #[test]
+    fn rejects_signing_in_place() {
+        let path = Path::new("image.bin");
+        let error = sign_image(SignOptions {
+            input: path,
+            output: path,
+            key: Path::new("key.pem"),
+            min_xous_version: "v0.9.8-790",
+            git_describe: "v0.10.2-0-g00000000",
+            pq_key: None,
+            pq_key_cache: None,
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("must differ"));
+    }
+
+    #[test]
+    fn rejects_pq_signature_that_exceeds_slot() {
+        let input = NamedTempFile::new().unwrap();
+        input
+            .as_file()
+            .set_len((KERNEL_START - BAREMETAL_START - SIGBLOCK_LEN) as u64)
+            .unwrap();
+        let output = input.path().with_extension("img");
+        let error = sign_image(SignOptions {
+            input: input.path(),
+            output: &output,
+            key: Path::new("key.pem"),
+            min_xous_version: "v0.9.8-790",
+            git_describe: "v0.10.2-0-g00000000",
+            pq_key: Some(Path::new("pq.key")),
+            pq_key_cache: Some(Path::new("pq.cache")),
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("PQ-signed image"));
     }
 }
