@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0
+
+version = 1
+
+[[annotations]]
+path = "include/bao1x_peri.h"
+SPDX-License-Identifier = "CERN-OHL-W-2.0"
+SPDX-FileCopyrightText = "2024-2025 Baochip / Crossbar"
+
+[[annotations]]
+path = "include/bao1x_peri.svd"
+SPDX-License-Identifier = "CERN-OHL-W-2.0"
+SPDX-FileCopyrightText = "2024-2025 Baochip / Crossbar"
