@@ -2,6 +2,7 @@
 
 use std::{
     error::Error,
+    ffi::OsStr,
     fmt, fs,
     io::{self, Write},
     mem::size_of,
@@ -20,6 +21,7 @@ use bao1x_api::{
 };
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use goblin::elf::{Elf, header::EM_RISCV, program_header::PT_LOAD};
+use rustix::fs::{AtFlags, Mode, OFlags};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
 use xous_semver::SemVer;
@@ -50,9 +52,16 @@ impl Error for ImageError {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum EmbeddedVerification {
+pub enum ClassicalVerification {
     Verified { key_slot: usize, key_tag: String },
     Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PqVerification {
+    NotPresent,
+    NotImplemented,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -75,9 +84,9 @@ pub struct InspectionReport {
     pub anti_rollback: u32,
     pub minimum_version_hex: String,
     pub image_version_hex: String,
-    pub pq_enabled: bool,
     pub embedded_keys: Vec<EmbeddedKey>,
-    pub embedded_verification: EmbeddedVerification,
+    pub classical_verification: ClassicalVerification,
+    pub pq_verification: PqVerification,
     pub device_acceptance: &'static str,
 }
 
@@ -85,6 +94,13 @@ pub struct InspectionReport {
 pub struct MountCandidate {
     pub path: PathBuf,
     pub label: String,
+    pub device: DeviceIdentity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceIdentity {
+    pub major: u32,
+    pub minor: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -115,10 +131,11 @@ fn inspect_image(image: &Uf2Image) -> Result<InspectionReport, Box<dyn Error>> {
     for block in image.iter() {
         bytes.extend_from_slice(block.payload());
     }
-    if bytes.len() < SIGBLOCK_LEN {
-        return Err(
-            ImageError::new("signed image is shorter than the 768-byte signature block").into(),
-        );
+    if bytes.len() < SIGBLOCK_LEN + size_of::<u32>() {
+        return Err(ImageError::new(
+            "signed image has no code word after the 768-byte signature block",
+        )
+        .into());
     }
 
     let header =
@@ -212,12 +229,12 @@ fn inspect_image(image: &Uf2Image) -> Result<InspectionReport, Box<dyn Error>> {
             } else {
                 false
             };
-            valid.then(|| EmbeddedVerification::Verified {
+            valid.then(|| ClassicalVerification::Verified {
                 key_slot: slot,
                 key_tag: tag_string(&key.tag),
             })
         })
-        .unwrap_or(EmbeddedVerification::Failed);
+        .unwrap_or(ClassicalVerification::Failed);
 
     Ok(InspectionReport {
         profile: "canonical_baochip_baremetal_uf2",
@@ -236,9 +253,13 @@ fn inspect_image(image: &Uf2Image) -> Result<InspectionReport, Box<dyn Error>> {
         anti_rollback: header.sealed_data.anti_rollback,
         minimum_version_hex: hex(&header.sealed_data.min_semver),
         image_version_hex: hex(&header.sealed_data.semver),
-        pq_enabled: header.sealed_data.pq_enabled != 0,
         embedded_keys,
-        embedded_verification: verification,
+        classical_verification: verification,
+        pq_verification: if header.sealed_data.pq_enabled == 0 {
+            PqVerification::NotPresent
+        } else {
+            PqVerification::NotImplemented
+        },
         device_acceptance: "unknown: depends on installed keys, revocations, lifecycle, anti-rollback, and PQ policy",
     })
 }
@@ -268,16 +289,38 @@ struct Lsblk {
 #[derive(Deserialize)]
 struct LsblkDevice {
     label: Option<String>,
+    #[serde(rename = "maj:min")]
+    major_minor: Option<String>,
     #[serde(default)]
     mountpoints: Vec<Option<PathBuf>>,
     #[serde(default)]
     children: Vec<LsblkDevice>,
 }
 
-fn collect_mounts(device: LsblkDevice, mounts: &mut Vec<MountCandidate>) {
+fn parse_device_identity(value: &str) -> Result<DeviceIdentity, ImageError> {
+    let (major, minor) = value
+        .split_once(':')
+        .ok_or_else(|| ImageError::new(format!("invalid lsblk MAJ:MIN value {value:?}")))?;
+    Ok(DeviceIdentity {
+        major: major
+            .parse()
+            .map_err(|_| ImageError::new(format!("invalid lsblk major number {major:?}")))?,
+        minor: minor
+            .parse()
+            .map_err(|_| ImageError::new(format!("invalid lsblk minor number {minor:?}")))?,
+    })
+}
+
+fn collect_mounts(device: LsblkDevice, mounts: &mut Vec<MountCandidate>) -> Result<(), ImageError> {
     if let Some(label) = device.label
         && (label == "BAOCHIP" || label == "ALTCHIP")
     {
+        let identity = parse_device_identity(
+            device
+                .major_minor
+                .as_deref()
+                .ok_or_else(|| ImageError::new("lsblk omitted MAJ:MIN for a Baochip volume"))?,
+        )?;
         mounts.extend(
             device
                 .mountpoints
@@ -286,18 +329,20 @@ fn collect_mounts(device: LsblkDevice, mounts: &mut Vec<MountCandidate>) {
                 .map(|path| MountCandidate {
                     path,
                     label: label.clone(),
+                    device: identity,
                 }),
         );
     }
     for child in device.children {
-        collect_mounts(child, mounts);
+        collect_mounts(child, mounts)?;
     }
+    Ok(())
 }
 
 /// Discover mounted Baochip boot volumes using block-device labels.
 pub fn discover_mounts() -> Result<Vec<MountCandidate>, Box<dyn Error>> {
     let output = Command::new("lsblk")
-        .args(["--json", "--output", "LABEL,MOUNTPOINTS"])
+        .args(["--json", "--output", "LABEL,MAJ:MIN,MOUNTPOINTS"])
         .output()?;
     if !output.status.success() {
         return Err(ImageError::new(format!("lsblk failed with {}", output.status)).into());
@@ -305,7 +350,7 @@ pub fn discover_mounts() -> Result<Vec<MountCandidate>, Box<dyn Error>> {
     let listing: Lsblk = serde_json::from_slice(&output.stdout)?;
     let mut mounts = Vec::new();
     for device in listing.blockdevices {
-        collect_mounts(device, &mut mounts);
+        collect_mounts(device, &mut mounts)?;
     }
     Ok(mounts)
 }
@@ -313,7 +358,7 @@ pub fn discover_mounts() -> Result<Vec<MountCandidate>, Box<dyn Error>> {
 fn select_mount(
     candidates: &[MountCandidate],
     requested: Option<&Path>,
-) -> Result<PathBuf, Box<dyn Error>> {
+) -> Result<MountCandidate, Box<dyn Error>> {
     let selected = if let Some(requested) = requested {
         let requested = requested.canonicalize()?;
         candidates
@@ -344,41 +389,81 @@ fn select_mount(
     if selected.label != "BAOCHIP" {
         return Err(ImageError::new("refusing ALTCHIP target").into());
     }
-    Ok(selected.path.canonicalize()?)
+    Ok(MountCandidate {
+        path: selected.path.canonicalize()?,
+        ..selected
+    })
 }
 
 trait CopyOps {
-    fn write_temp(&mut self, path: &Path, bytes: &[u8]) -> io::Result<()>;
-    fn rename(&mut self, source: &Path, destination: &Path) -> io::Result<()>;
-    fn sync_directory(&mut self, path: &Path) -> io::Result<()>;
+    fn create_final(&mut self, directory: &fs::File, name: &OsStr) -> io::Result<fs::File>;
+    fn write_all(&mut self, file: &mut fs::File, bytes: &[u8]) -> io::Result<()>;
+    fn flush(&mut self, file: &mut fs::File) -> io::Result<()>;
+    fn sync_file(&mut self, file: &fs::File) -> io::Result<()>;
+    fn sync_directory(&mut self, directory: &fs::File) -> io::Result<()>;
+    fn unlink(&mut self, directory: &fs::File, name: &OsStr) -> io::Result<()>;
 }
 
 struct FsCopyOps;
 
 impl CopyOps for FsCopyOps {
-    fn write_temp(&mut self, path: &Path, bytes: &[u8]) -> io::Result<()> {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)?;
-        file.write_all(bytes)?;
-        file.flush()?;
+    fn create_final(&mut self, directory: &fs::File, name: &OsStr) -> io::Result<fs::File> {
+        let fd = rustix::fs::openat(
+            directory,
+            name,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::ROTH,
+        )?;
+        Ok(fd.into())
+    }
+
+    fn write_all(&mut self, file: &mut fs::File, bytes: &[u8]) -> io::Result<()> {
+        file.write_all(bytes)
+    }
+
+    fn flush(&mut self, file: &mut fs::File) -> io::Result<()> {
+        file.flush()
+    }
+
+    fn sync_file(&mut self, file: &fs::File) -> io::Result<()> {
         file.sync_all()
     }
 
-    fn rename(&mut self, source: &Path, destination: &Path) -> io::Result<()> {
-        Ok(rustix::fs::renameat_with(
-            rustix::fs::CWD,
-            source,
-            rustix::fs::CWD,
-            destination,
-            rustix::fs::RenameFlags::NOREPLACE,
-        )?)
+    fn sync_directory(&mut self, directory: &fs::File) -> io::Result<()> {
+        directory.sync_all()
     }
 
-    fn sync_directory(&mut self, path: &Path) -> io::Result<()> {
-        fs::File::open(path)?.sync_all()
+    fn unlink(&mut self, directory: &fs::File, name: &OsStr) -> io::Result<()> {
+        Ok(rustix::fs::unlinkat(directory, name, AtFlags::empty())?)
     }
+}
+
+fn open_pinned_directory(candidate: &MountCandidate) -> Result<fs::File, Box<dyn Error>> {
+    let fd = rustix::fs::openat(
+        rustix::fs::CWD,
+        &candidate.path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    let stat = rustix::fs::fstat(&fd)?;
+    let actual = DeviceIdentity {
+        major: rustix::fs::major(stat.st_dev),
+        minor: rustix::fs::minor(stat.st_dev),
+    };
+    if actual != candidate.device {
+        return Err(ImageError::new(format!(
+            "selected mount changed identity: discovery found {}:{}, opened filesystem is {}:{}",
+            candidate.device.major, candidate.device.minor, actual.major, actual.minor
+        ))
+        .into());
+    }
+    Ok(fd.into())
+}
+
+fn partial_copy_error(error: &io::Error) -> ImageError {
+    ImageError::new(format!(
+        "copy failed after creating the destination ({error}); cleanup was attempted, but the device may have consumed partial data"
+    ))
 }
 
 fn copy_with_ops(
@@ -394,30 +479,41 @@ fn copy_with_ops(
         .file_name()
         .filter(|name| !name.is_empty())
         .ok_or_else(|| ImageError::new("image path has no filename"))?;
-    let destination = target.join(filename);
-    if destination.exists() {
-        return Err(
-            ImageError::new(format!("refusing to overwrite {}", destination.display())).into(),
-        );
-    }
-    if !dry_run {
-        let temporary = target.join(format!(".{}.bao-image.tmp", filename.to_string_lossy()));
-        if temporary.exists() {
-            return Err(ImageError::new(format!(
-                "temporary file already exists: {}",
-                temporary.display()
+    let destination = target.path.join(filename);
+    let directory = open_pinned_directory(&target)?;
+    if dry_run {
+        match rustix::fs::statat(&directory, filename, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(_) => {
+                return Err(ImageError::new(format!(
+                    "refusing to overwrite {}",
+                    destination.display()
+                ))
+                .into());
+            }
+            Err(rustix::io::Errno::NOENT) => {}
+            Err(error) => return Err(error.into()),
+        }
+    } else {
+        let mut file = ops.create_final(&directory, filename).map_err(|error| {
+            ImageError::new(format!(
+                "refusing to create {} before writing any bytes: {error}",
+                destination.display()
             ))
-            .into());
+        })?;
+        let result = ops
+            .write_all(&mut file, bytes)
+            .and_then(|()| ops.flush(&mut file))
+            .and_then(|()| ops.sync_file(&file))
+            .and_then(|()| ops.sync_directory(&directory));
+        if let Err(error) = result {
+            drop(file);
+            let _ = ops.unlink(&directory, filename);
+            let _ = ops.sync_directory(&directory);
+            return Err(partial_copy_error(&error).into());
         }
-        ops.write_temp(&temporary, bytes)?;
-        if let Err(error) = ops.rename(&temporary, &destination) {
-            let _ = fs::remove_file(&temporary);
-            return Err(error.into());
-        }
-        ops.sync_directory(&target)?;
     }
     Ok(CopyReport {
-        target,
+        target: target.path,
         destination,
         dry_run,
         bytes: bytes.len(),
@@ -431,10 +527,16 @@ pub fn copy_image(options: CopyOptions<'_>) -> Result<CopyReport, Box<dyn Error>
     if !inspection.compatible_header {
         return Err(ImageError::new("refusing to copy: signed header is not compatible").into());
     }
-    if inspection.embedded_verification == EmbeddedVerification::Failed {
+    if inspection.classical_verification == ClassicalVerification::Failed {
         return Err(
             ImageError::new("refusing to copy: no embedded key verifies the signature").into(),
         );
+    }
+    if inspection.pq_verification == PqVerification::NotImplemented {
+        return Err(ImageError::new(
+            "refusing to copy: PQ signature verification is not implemented",
+        )
+        .into());
     }
     let candidates = discover_mounts()?;
     copy_with_ops(
@@ -692,7 +794,7 @@ mod tests {
         Ok(fs::read(output.path())?)
     }
 
-    fn signed_uf2() -> Vec<u8> {
+    fn signed_image(pq_tail: Option<&[u8]>) -> Vec<u8> {
         let signing_key = SigningKey::from_bytes(&[7; 32]);
         let mut header = SignatureInFlash {
             _jal_instruction: HEADER_JUMP,
@@ -700,6 +802,7 @@ mod tests {
         };
         header.sealed_data.function_code = FunctionCode::Baremetal as u32;
         header.sealed_data.anti_rollback = 1;
+        header.sealed_data.pq_enabled = u32::from(pq_tail.is_some());
         header.sealed_data.pubkeys[3].pk = signing_key.verifying_key().to_bytes();
         header.sealed_data.pubkeys[3].tag = *b"dev ";
 
@@ -715,6 +818,14 @@ mod tests {
 
         let mut image = header.as_ref()[..UNSIGNED_LEN].to_vec();
         image.extend_from_slice(&protected);
+        if let Some(pq_tail) = pq_tail {
+            assert_eq!(pq_tail.len(), SIGNATURE_PQ_LENGTH);
+            image.extend_from_slice(pq_tail);
+        }
+        image
+    }
+
+    fn uf2_from_image(image: &[u8]) -> Vec<u8> {
         let blocks = image.len().div_ceil(256) as u32;
         let mut uf2 = Vec::with_capacity(blocks as usize * 512);
         for number in 0..blocks {
@@ -738,25 +849,67 @@ mod tests {
         uf2
     }
 
+    fn signed_uf2() -> Vec<u8> {
+        uf2_from_image(&signed_image(None))
+    }
+
+    fn device_identity(path: &Path) -> DeviceIdentity {
+        let directory = fs::File::open(path).unwrap();
+        let stat = rustix::fs::fstat(directory).unwrap();
+        DeviceIdentity {
+            major: rustix::fs::major(stat.st_dev),
+            minor: rustix::fs::minor(stat.st_dev),
+        }
+    }
+
     #[derive(Default)]
     struct RecordingOps {
         events: Vec<&'static str>,
+        fail: Option<&'static str>,
     }
 
     impl CopyOps for RecordingOps {
-        fn write_temp(&mut self, path: &Path, bytes: &[u8]) -> io::Result<()> {
-            self.events.push("write_sync");
-            FsCopyOps.write_temp(path, bytes)
+        fn create_final(&mut self, directory: &fs::File, name: &OsStr) -> io::Result<fs::File> {
+            self.events.push("create_final");
+            if self.fail == Some("create_final") {
+                return Err(io::Error::other("injected create failure"));
+            }
+            FsCopyOps.create_final(directory, name)
         }
 
-        fn rename(&mut self, source: &Path, destination: &Path) -> io::Result<()> {
-            self.events.push("rename");
-            FsCopyOps.rename(source, destination)
+        fn write_all(&mut self, file: &mut fs::File, bytes: &[u8]) -> io::Result<()> {
+            self.events.push("write_all");
+            if self.fail == Some("write_all") {
+                file.write_all(&bytes[..1])?;
+                return Err(io::Error::other("injected partial write"));
+            }
+            FsCopyOps.write_all(file, bytes)
         }
 
-        fn sync_directory(&mut self, path: &Path) -> io::Result<()> {
+        fn flush(&mut self, file: &mut fs::File) -> io::Result<()> {
+            self.events.push("flush");
+            FsCopyOps.flush(file)
+        }
+
+        fn sync_file(&mut self, file: &fs::File) -> io::Result<()> {
+            self.events.push("sync_file");
+            if self.fail == Some("sync_file") {
+                return Err(io::Error::other("injected file sync failure"));
+            }
+            FsCopyOps.sync_file(file)
+        }
+
+        fn sync_directory(&mut self, directory: &fs::File) -> io::Result<()> {
             self.events.push("sync_directory");
-            FsCopyOps.sync_directory(path)
+            if self.fail == Some("sync_directory") {
+                return Err(io::Error::other("injected directory sync failure"));
+            }
+            FsCopyOps.sync_directory(directory)
+        }
+
+        fn unlink(&mut self, directory: &fs::File, name: &OsStr) -> io::Result<()> {
+            self.events.push("unlink");
+            FsCopyOps.unlink(directory, name)
         }
     }
 
@@ -764,6 +917,7 @@ mod tests {
         MountCandidate {
             path: directory.path().to_path_buf(),
             label: label.to_owned(),
+            device: device_identity(directory.path()),
         }
     }
 
@@ -772,13 +926,93 @@ mod tests {
         let report = inspect_bytes(&signed_uf2()).unwrap();
         assert_eq!(report.profile, "canonical_baochip_baremetal_uf2");
         assert_eq!(
-            report.embedded_verification,
-            EmbeddedVerification::Verified {
+            report.classical_verification,
+            ClassicalVerification::Verified {
                 key_slot: 3,
                 key_tag: "dev".to_owned()
             }
         );
+        assert_eq!(report.pq_verification, PqVerification::NotPresent);
         assert!(report.device_acceptance.starts_with("unknown"));
+    }
+
+    #[test]
+    fn rejects_image_ending_at_signature_block_without_panicking() {
+        let image = signed_image(None);
+        let error = inspect_bytes(&uf2_from_image(&image[..SIGBLOCK_LEN]))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no code word"));
+    }
+
+    #[test]
+    fn reports_arbitrary_pq_tail_as_not_verified() {
+        let report = inspect_bytes(&uf2_from_image(&signed_image(Some(
+            &[0x5a; SIGNATURE_PQ_LENGTH],
+        ))))
+        .unwrap();
+        assert!(matches!(
+            report.classical_verification,
+            ClassicalVerification::Verified { .. }
+        ));
+        assert_eq!(report.pq_verification, PqVerification::NotImplemented);
+    }
+
+    #[test]
+    fn corrupted_pq_tail_remains_explicitly_unverified() {
+        let mut image = signed_image(Some(&[0xa5; SIGNATURE_PQ_LENGTH]));
+        *image.last_mut().unwrap() ^= 1;
+        let report = inspect_bytes(&uf2_from_image(&image)).unwrap();
+        assert_eq!(report.pq_verification, PqVerification::NotImplemented);
+    }
+
+    #[test]
+    fn copy_refuses_pq_images_before_target_discovery() {
+        let mut image = NamedTempFile::new().unwrap();
+        image
+            .write_all(&uf2_from_image(&signed_image(Some(
+                &[0xa5; SIGNATURE_PQ_LENGTH],
+            ))))
+            .unwrap();
+        let error = copy_image(CopyOptions {
+            image: image.path(),
+            target: None,
+            dry_run: false,
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("PQ signature verification"));
+    }
+
+    #[test]
+    fn copy_refuses_bad_classical_signature_before_target_discovery() {
+        let mut uf2 = signed_uf2();
+        uf2[32 + 4] ^= 1;
+        let mut image = NamedTempFile::new().unwrap();
+        image.write_all(&uf2).unwrap();
+        let error = copy_image(CopyOptions {
+            image: image.path(),
+            target: None,
+            dry_run: false,
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("no embedded key verifies"));
+    }
+
+    #[test]
+    fn copy_refuses_malformed_header_before_target_discovery() {
+        let mut uf2 = signed_uf2();
+        let magic_offset = std::mem::offset_of!(SignatureInFlash, sealed_data)
+            + std::mem::offset_of!(bao1x_api::signatures::SealedFields, magic);
+        uf2[32 + magic_offset] ^= 1;
+        let mut image = NamedTempFile::new().unwrap();
+        image.write_all(&uf2).unwrap();
+        let error = copy_image(CopyOptions {
+            image: image.path(),
+            target: None,
+            dry_run: false,
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("magic"));
     }
 
     #[test]
@@ -813,6 +1047,45 @@ mod tests {
     }
 
     #[test]
+    fn refuses_no_target() {
+        assert!(
+            select_mount(&[], None)
+                .unwrap_err()
+                .to_string()
+                .contains("no mounted")
+        );
+    }
+
+    #[test]
+    fn refuses_unknown_explicit_target() {
+        let known = TempDir::new().unwrap();
+        let unknown = TempDir::new().unwrap();
+        let error =
+            select_mount(&[candidate(&known, "BAOCHIP")], Some(unknown.path())).unwrap_err();
+        assert!(error.to_string().contains("not a mounted"));
+    }
+
+    #[test]
+    fn refuses_mount_identity_mismatch_before_create() {
+        let mount = TempDir::new().unwrap();
+        let mut mount_candidate = candidate(&mount, "BAOCHIP");
+        mount_candidate.device.minor = mount_candidate.device.minor.wrapping_add(1);
+        let mut ops = RecordingOps::default();
+        let error = copy_with_ops(
+            Path::new("firmware.uf2"),
+            b"validated",
+            &[mount_candidate],
+            None,
+            false,
+            &mut ops,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("changed identity"));
+        assert!(ops.events.is_empty());
+        assert!(!mount.path().join("firmware.uf2").exists());
+    }
+
+    #[test]
     fn dry_run_does_not_open_target_files() {
         let mount = TempDir::new().unwrap();
         let mut ops = RecordingOps::default();
@@ -831,7 +1104,29 @@ mod tests {
     }
 
     #[test]
-    fn copy_writes_then_renames_then_syncs_directory() {
+    fn dry_run_refuses_existing_destination_without_writing() {
+        let mount = TempDir::new().unwrap();
+        fs::write(mount.path().join("firmware.uf2"), b"existing").unwrap();
+        let mut ops = RecordingOps::default();
+        let error = copy_with_ops(
+            Path::new("firmware.uf2"),
+            b"validated",
+            &[candidate(&mount, "BAOCHIP")],
+            None,
+            true,
+            &mut ops,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("refusing to overwrite"));
+        assert!(ops.events.is_empty());
+        assert_eq!(
+            fs::read(mount.path().join("firmware.uf2")).unwrap(),
+            b"existing"
+        );
+    }
+
+    #[test]
+    fn copy_creates_final_then_writes_and_syncs() {
         let mount = TempDir::new().unwrap();
         let mut ops = RecordingOps::default();
         let report = copy_with_ops(
@@ -843,8 +1138,95 @@ mod tests {
             &mut ops,
         )
         .unwrap();
-        assert_eq!(ops.events, ["write_sync", "rename", "sync_directory"]);
+        assert_eq!(
+            ops.events,
+            [
+                "create_final",
+                "write_all",
+                "flush",
+                "sync_file",
+                "sync_directory"
+            ]
+        );
         assert_eq!(fs::read(report.destination).unwrap(), b"validated");
+    }
+
+    #[test]
+    fn destination_race_fails_before_writing_bytes() {
+        let mount = TempDir::new().unwrap();
+        fs::write(mount.path().join("firmware.uf2"), b"existing").unwrap();
+        let mut ops = RecordingOps::default();
+        let error = copy_with_ops(
+            Path::new("firmware.uf2"),
+            b"validated",
+            &[candidate(&mount, "BAOCHIP")],
+            None,
+            false,
+            &mut ops,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("before writing any bytes"));
+        assert_eq!(ops.events, ["create_final"]);
+        assert_eq!(
+            fs::read(mount.path().join("firmware.uf2")).unwrap(),
+            b"existing"
+        );
+    }
+
+    #[test]
+    fn create_failure_occurs_before_writing_bytes() {
+        let mount = TempDir::new().unwrap();
+        let mut ops = RecordingOps {
+            fail: Some("create_final"),
+            ..RecordingOps::default()
+        };
+        let error = copy_with_ops(
+            Path::new("firmware.uf2"),
+            b"validated",
+            &[candidate(&mount, "BAOCHIP")],
+            None,
+            false,
+            &mut ops,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("before writing any bytes"));
+        assert_eq!(ops.events, ["create_final"]);
+        assert!(!mount.path().join("firmware.uf2").exists());
+    }
+
+    #[test]
+    fn partial_write_is_unlinked_with_device_warning() {
+        assert_failed_copy_cleanup("write_all");
+    }
+
+    #[test]
+    fn file_sync_failure_is_unlinked_with_device_warning() {
+        assert_failed_copy_cleanup("sync_file");
+    }
+
+    #[test]
+    fn directory_sync_failure_is_unlinked_with_device_warning() {
+        assert_failed_copy_cleanup("sync_directory");
+    }
+
+    fn assert_failed_copy_cleanup(failure: &'static str) {
+        let mount = TempDir::new().unwrap();
+        let mut ops = RecordingOps {
+            fail: Some(failure),
+            ..RecordingOps::default()
+        };
+        let error = copy_with_ops(
+            Path::new("firmware.uf2"),
+            b"validated",
+            &[candidate(&mount, "BAOCHIP")],
+            None,
+            false,
+            &mut ops,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("may have consumed partial data"));
+        assert!(ops.events.contains(&"unlink"));
+        assert!(!mount.path().join("firmware.uf2").exists());
     }
 
     #[test]

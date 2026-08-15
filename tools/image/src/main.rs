@@ -3,7 +3,8 @@
 use std::{error::Error, path::PathBuf};
 
 use bao_image::{
-    CopyOptions, EmbeddedVerification, SignOptions, copy_image, inspect_file, pack_elf, sign_image,
+    ClassicalVerification, CopyOptions, PqVerification, SignOptions, copy_image, inspect_file,
+    pack_elf, sign_image,
 };
 use clap::{Parser, Subcommand};
 
@@ -94,14 +95,19 @@ fn main() -> Result<(), Box<dyn Error>> {
                 println!("anti-rollback: {}", report.anti_rollback);
                 println!("minimum version: {}", report.minimum_version_hex);
                 println!("image version: {}", report.image_version_hex);
-                println!("PQ signature present: {}", report.pq_enabled);
-                match report.embedded_verification {
-                    EmbeddedVerification::Verified { key_slot, key_tag } => {
+                match report.classical_verification {
+                    ClassicalVerification::Verified { key_slot, key_tag } => {
                         println!(
-                            "embedded-key verification: passed (slot {key_slot}, tag {key_tag:?})"
+                            "classical verification: passed (embedded slot {key_slot}, tag {key_tag:?})"
                         );
                     }
-                    EmbeddedVerification::Failed => println!("embedded-key verification: failed"),
+                    ClassicalVerification::Failed => println!("classical verification: failed"),
+                }
+                match report.pq_verification {
+                    PqVerification::NotPresent => println!("PQ verification: not present"),
+                    PqVerification::NotImplemented => {
+                        println!("PQ verification: not implemented (copy will refuse this image)")
+                    }
                 }
                 println!("device acceptance: {}", report.device_acceptance);
             }
