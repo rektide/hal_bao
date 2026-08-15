@@ -46,3 +46,6 @@ Run the host-side tests with:
 ```sh
 cargo test -p bao-image
 ```
+
+`bao-boot1-protocol` provides transport-independent canonical UF2 validation
+and boot1 REPL transfer behavior. `bao-uf2send` is its serial-port CLI frontend.

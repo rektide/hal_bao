@@ -47,11 +47,12 @@ do not remain available after boot1 hands control to Zephyr.
 | Dedicated TX-only DUART | Used for low-level diagnostics and Verilator; its Dabao package pin is unconnected | No |
 | LED/GPIO marker | Not applicable; no user LED | No |
 
-The upstream Xous
-`bao1x-boot/uf2send.py` sends the same UF2 over the boot1 REPL with per-block
-acknowledgments and retries. The present `hal_bao` workflow supports signed UF2
-generation and documented manual MSC copy; it has not yet integrated
-`uf2send.py` or `west flash`.
+The `bao-uf2send` tool sends the same UF2 over the boot1 REPL with per-block
+acknowledgments and retries. Its reusable `bao-boot1-protocol` crate validates
+the complete canonical image before transfer. A boot1 `Wrote` acknowledgment
+confirms protocol handling, not persistence: after a failed RRAM write, boot1
+can print `Write error` and then still print `Wrote`. Independently verify the
+installed image before treating the update as durable.
 
 ## Artifact bundle
 
