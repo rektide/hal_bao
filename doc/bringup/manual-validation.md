@@ -54,6 +54,11 @@ confirms protocol handling, not persistence: after a failed RRAM write, boot1
 can print `Write error` and then still print `Wrote`. Independently verify the
 installed image before treating the update as durable.
 
+The package boundary is intentional: `bao-boot1-protocol` is the reusable,
+transport-independent validation and REPL protocol library;
+[`bao-uf2send`](/tools/uf2send/README.md) is the serial-port binary used with
+either USB CDC-ACM or physical UART2.
+
 ## Artifact bundle
 
 The current local bundle is in
@@ -185,6 +190,33 @@ lsblk -o NAME,LABEL,FSTYPE,SIZE,MOUNTPOINTS
 ```
 
 ## Install the image
+
+The MSC copy below remains the primary procedure for this validation bundle.
+As an alternative, keep the device in boot1 and send the same canonical UF2
+over USB CDC-ACM:
+
+```sh
+cargo run -p bao-uf2send -- dabao-zephyr-hello.uf2 \
+  --port /dev/ttyACM0
+```
+
+Or use a 3.3 V serial adapter on physical UART2 (PB14 board TX, PB13 board RX,
+and ground) at 1,000,000 baud, 8-N-1:
+
+```sh
+cargo run -p bao-uf2send -- dabao-zephyr-hello.uf2 \
+  --port /dev/ttyUSB0 --baud 1000000
+```
+
+Use `cargo run -p bao-uf2send -- --list-ports` to list candidates. The sender
+preflights all blocks before opening the port, probes boot1 `has-crc`, uses CRC
+acknowledgments when available, and otherwise uses legacy acknowledgments. It
+requires an exact acknowledgment and makes at most three attempts per block by
+default; `--timeout-ms`, `--settle-ms`, and `--retries` adjust those bounds.
+This does not replace the earlier `audit`: host validation cannot establish
+device key, anti-rollback, or PQ policy. It also cannot detect persistence when
+affected boot1 versions print `Write error` and then `Wrote`, so independently
+verify installation before treating serial transfer as durable.
 
 1. Confirm that exactly one FAT volume has label `BAOCHIP`.
 2. Confirm that the selected mount is not labeled `ALTCHIP`.

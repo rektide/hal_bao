@@ -67,6 +67,14 @@ size/address acknowledgment, and retries failed blocks. Zephyr integration
 should adopt or thinly wrap this implementation rather than invent another
 serial protocol.
 
+That was the upstream precedent when this note was written. The recommendation
+has since been implemented locally as two Rust packages: the reusable
+`bao-boot1-protocol` library and the
+[`bao-uf2send`](/tools/uf2send/README.md) serial binary. The library preserves
+the upstream REPL behavior while adding complete canonical-image preflight and
+`has-crc` negotiation; the binary opens either USB CDC-ACM or physical UART2.
+The split keeps serial-port policy out of the protocol library.
+
 After handoff, none of these boot1 services remain available unless Zephyr
 implements the corresponding USB or UART driver.
 
@@ -160,13 +168,25 @@ bring-up bottleneck:
 - Host validation cannot predict device-local revocation, anti-rollback, and PQ
   policy. Boot1 `audit` remains the preflight authority.
 
-Therefore canonical UF2 inspection and a thin explicit-target MSC runner are
-P2 conveniences. Hardware-visible UDMA UART2 output is P1. Serial upload should
-reuse Xous `uf2send.py`.
+Therefore canonical UF2 inspection and a thin explicit-target MSC runner were
+identified as P2 conveniences, while hardware-visible UDMA UART2 output
+remained P1. The serial-upload recommendation was to reuse Xous `uf2send.py`;
+the subsequent `bao-boot1-protocol` and `bao-uf2send` implementation now does
+so at the protocol level rather than leaving serial upload unintegrated.
+
+The current sender preflights the entire image before opening a port, probes
+`has-crc`, requires exact size/address acknowledgments (and CRC when supported),
+and bounds attempts per block. These host guarantees do not supersede boot1
+`audit`, which remains necessary for device-local key, anti-rollback, and PQ
+policy. They also do not prove RRAM persistence: affected boot1 versions can
+print `Write error` and then `Wrote`, so an acknowledged transfer still needs
+independent installation verification.
 
 ## Cross-references
 
 - [`/doc/bringup/manual-validation.md`](/doc/bringup/manual-validation.md) - operator procedure derived from this lifecycle model.
+- [`/tools/uf2send/README.md`](/tools/uf2send/README.md) - current USB CDC and physical-UART CLI, protocol guarantees, and persistence limitation.
+- [`/tools/README.md`](/tools/README.md) - image-tool and two-package serial-delivery architecture.
 - [`/.design/research/01-boot-delivery.md`](/.design/research/01-boot-delivery.md) - image format, slot layout, signing, and handoff mechanics.
 - [`/.design/research/04-synthesis.md`](/.design/research/04-synthesis.md) - overall milestone plan and risk register.
 - [`/include/PROVENANCE.md`](/include/PROVENANCE.md) - generated register source and revision.

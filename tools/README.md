@@ -47,5 +47,15 @@ Run the host-side tests with:
 cargo test -p bao-image
 ```
 
-`bao-boot1-protocol` provides transport-independent canonical UF2 validation
-and boot1 REPL transfer behavior. `bao-uf2send` is its serial-port CLI frontend.
+Serial delivery has two packages:
+
+- `bao-boot1-protocol` is the reusable library for transport-independent
+  canonical UF2 preflight, boot1 REPL negotiation, acknowledgments, and retry
+  behavior.
+- [`bao-uf2send`](/tools/uf2send/README.md) is the serial-port binary for USB
+  CDC-ACM and physical Dabao UART2.
+
+The CLI preflights the complete image before opening the serial port. This is
+artifact validation, not device lifecycle validation: run boot1 `audit` before
+transfer as described in the
+[`manual validation guide`](/doc/bringup/manual-validation.md).

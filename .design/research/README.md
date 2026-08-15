@@ -22,7 +22,8 @@ Read `04-synthesis.md` first; the rest are its sources.
   (M0–M5), risk register, open questions.
 - [`05-lifecycle-delivery-validation.md`](05-lifecycle-delivery-validation.md)
   — device audit preflight, developer mode and one-way counters, boot1 transport
-  modes, observable Dabao outputs, and runner scope.
+  modes, serial uploader progression, observable Dabao outputs, and runner
+  scope.
 - [`06-irq-ack-semantics.md`](06-irq-ack-semantics.md) — RTL-proven irqarray
   edge/level behavior, positive enable polarity, W1C ordering, lost-event
   constraints, Xous sequences, and the concrete Zephyr dispatch algorithm.

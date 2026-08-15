@@ -12,9 +12,12 @@ is no vendor C SDK. Consequently hal_bao is *not* a classic vendor-HAL mirror li
   `include/bao1x_peri.svd`) extracted from the chip RTL by the
   [`rtl_to_svd.py`](https://github.com/baochip/baochip-1x/blob/main/rtl/scripts/headergen/rtl_to_svd.py)
   headergen flow, with provenance recorded in `include/PROVENANCE.md`.
-- **Boot image tooling** (`tools/`): devkey signing wrapper and a
-  `.data`-capable image packer (the stock `xous-copy-object` strips `.data`,
-  which a Zephyr image cannot tolerate).
+- **Boot image tooling** ([`tools/`](/tools/README.md)): devkey signing wrapper,
+  a `.data`-capable image packer (the stock `xous-copy-object` strips `.data`,
+  which a Zephyr image cannot tolerate), and serial UF2 delivery through the
+  boot1 REPL. Serial delivery is split between the reusable
+  `bao-boot1-protocol` library and the [`bao-uf2send`](/tools/uf2send/README.md)
+  USB CDC/physical-UART CLI.
 - **Tickets and planning** (`.beads/`) for the port effort, tracked as
   `bao-*` issues.
 - **Design docs** (`.design/`) narrating the effort.
