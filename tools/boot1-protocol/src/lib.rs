@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::{
-    error::Error,
-    fmt, fs,
+    fs,
     io::{self, Read, Write},
     path::Path,
     thread,
@@ -10,6 +9,7 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use thiserror::Error;
 
 pub const BLOCK_SIZE: usize = 512;
 pub const BAOCHIP_FAMILY_ID: u32 = 0xa7d7_6373;
@@ -23,33 +23,103 @@ const FAMILY_ID_PRESENT: u32 = 0x0000_2000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Uf2Block {
-    pub number: u32,
-    pub address: u32,
-    pub payload_size: u32,
-    pub bytes: [u8; BLOCK_SIZE],
+    number: u32,
+    address: u32,
+    payload_size: u32,
+    bytes: [u8; BLOCK_SIZE],
+}
+
+impl Uf2Block {
+    pub fn number(&self) -> u32 {
+        self.number
+    }
+
+    pub fn address(&self) -> u32 {
+        self.address
+    }
+
+    pub fn payload_size(&self) -> u32 {
+        self.payload_size
+    }
+
+    pub fn bytes(&self) -> &[u8; BLOCK_SIZE] {
+        &self.bytes
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Uf2Image {
-    pub blocks: Vec<Uf2Block>,
+    blocks: Vec<Uf2Block>,
 }
 
-#[derive(Debug)]
-pub struct SendError(String);
+impl Uf2Image {
+    pub fn blocks(&self) -> &[Uf2Block] {
+        &self.blocks
+    }
 
-impl SendError {
-    fn new(message: impl Into<String>) -> Self {
-        Self(message.into())
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &Uf2Block> {
+        self.blocks.iter()
+    }
+
+    pub fn len(&self) -> usize {
+        self.blocks.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.blocks.is_empty()
     }
 }
 
-impl fmt::Display for SendError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
-    }
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum PreflightError {
+    #[error("UF2 size must be a non-zero multiple of {BLOCK_SIZE}, got {actual}")]
+    InvalidSize { actual: usize },
+    #[error("UF2 has too many blocks")]
+    TooManyBlocks,
+    #[error("block {block} has invalid UF2 magic")]
+    InvalidMagic { block: usize },
+    #[error("block {block} has non-canonical flags 0x{actual:08x}, expected 0x{expected:08x}")]
+    NonCanonicalFlags {
+        block: usize,
+        actual: u32,
+        expected: u32,
+    },
+    #[error("block {block} family is 0x{actual:08x}, expected Baochip 0x{expected:08x}")]
+    WrongFamily {
+        block: usize,
+        actual: u32,
+        expected: u32,
+    },
+    #[error("block {block} payload is {actual} bytes, expected canonical 256")]
+    WrongPayloadSize { block: usize, actual: u32 },
+    #[error("block {block} numbering is {number}/{total}, expected {block}/{expected_total}")]
+    WrongNumbering {
+        block: usize,
+        number: u32,
+        total: u32,
+        expected_total: u32,
+    },
+    #[error(
+        "block {block} address is 0x{actual:08x}, expected contiguous baremetal address 0x{expected:08x}"
+    )]
+    NonContiguousAddress {
+        block: usize,
+        actual: u32,
+        expected: u32,
+    },
+    #[error("block {block} address overflows")]
+    AddressOverflow { block: usize },
+    #[error("block {block} range 0x{start:08x}..0x{end:08x} is outside the baremetal slot")]
+    OutsideBaremetalSlot { block: usize, start: u32, end: u32 },
 }
 
-impl Error for SendError {}
+#[derive(Debug, Error)]
+pub enum ImageFileError {
+    #[error("could not read UF2 image: {0}")]
+    Read(#[from] io::Error),
+    #[error(transparent)]
+    Invalid(#[from] PreflightError),
+}
 
 fn word(bytes: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(
@@ -60,16 +130,15 @@ fn word(bytes: &[u8], offset: usize) -> u32 {
 }
 
 /// Parse and validate the canonical UF2 emitted by `bao-image` for the baremetal slot.
-pub fn preflight_bytes(bytes: &[u8]) -> Result<Uf2Image, SendError> {
+pub fn preflight_bytes(bytes: &[u8]) -> Result<Uf2Image, PreflightError> {
     if bytes.is_empty() || !bytes.len().is_multiple_of(BLOCK_SIZE) {
-        return Err(SendError::new(format!(
-            "UF2 size must be a non-zero multiple of {BLOCK_SIZE}, got {}",
-            bytes.len()
-        )));
+        return Err(PreflightError::InvalidSize {
+            actual: bytes.len(),
+        });
     }
 
-    let expected_total = u32::try_from(bytes.len() / BLOCK_SIZE)
-        .map_err(|_| SendError::new("UF2 has too many blocks"))?;
+    let expected_total =
+        u32::try_from(bytes.len() / BLOCK_SIZE).map_err(|_| PreflightError::TooManyBlocks)?;
     let mut blocks = Vec::with_capacity(expected_total as usize);
     let mut expected_address = BAREMETAL_START;
 
@@ -78,15 +147,15 @@ pub fn preflight_bytes(bytes: &[u8]) -> Result<Uf2Image, SendError> {
             || word(bytes, 4) != MAGIC_START1
             || word(bytes, 508) != MAGIC_END
         {
-            return Err(SendError::new(format!(
-                "block {index} has invalid UF2 magic"
-            )));
+            return Err(PreflightError::InvalidMagic { block: index });
         }
         let flags = word(bytes, 8);
         if flags != FAMILY_ID_PRESENT {
-            return Err(SendError::new(format!(
-                "block {index} has non-canonical flags 0x{flags:08x}, expected 0x{FAMILY_ID_PRESENT:08x}"
-            )));
+            return Err(PreflightError::NonCanonicalFlags {
+                block: index,
+                actual: flags,
+                expected: FAMILY_ID_PRESENT,
+            });
         }
         let address = word(bytes, 12);
         let payload_size = word(bytes, 16);
@@ -95,32 +164,42 @@ pub fn preflight_bytes(bytes: &[u8]) -> Result<Uf2Image, SendError> {
         let family = word(bytes, 28);
 
         if family != BAOCHIP_FAMILY_ID {
-            return Err(SendError::new(format!(
-                "block {index} family is 0x{family:08x}, expected Baochip 0x{BAOCHIP_FAMILY_ID:08x}"
-            )));
+            return Err(PreflightError::WrongFamily {
+                block: index,
+                actual: family,
+                expected: BAOCHIP_FAMILY_ID,
+            });
         }
         if payload_size != 256 {
-            return Err(SendError::new(format!(
-                "block {index} payload is {payload_size} bytes, expected canonical 256"
-            )));
+            return Err(PreflightError::WrongPayloadSize {
+                block: index,
+                actual: payload_size,
+            });
         }
         if number != index as u32 || total != expected_total {
-            return Err(SendError::new(format!(
-                "block {index} numbering is {number}/{total}, expected {index}/{expected_total}"
-            )));
+            return Err(PreflightError::WrongNumbering {
+                block: index,
+                number,
+                total,
+                expected_total,
+            });
         }
         if address != expected_address {
-            return Err(SendError::new(format!(
-                "block {index} address is 0x{address:08x}, expected contiguous baremetal address 0x{expected_address:08x}"
-            )));
+            return Err(PreflightError::NonContiguousAddress {
+                block: index,
+                actual: address,
+                expected: expected_address,
+            });
         }
         let end = address
             .checked_add(payload_size)
-            .ok_or_else(|| SendError::new(format!("block {index} address overflows")))?;
+            .ok_or(PreflightError::AddressOverflow { block: index })?;
         if address < BAREMETAL_START || end > BAREMETAL_END {
-            return Err(SendError::new(format!(
-                "block {index} range 0x{address:08x}..0x{end:08x} is outside the baremetal slot"
-            )));
+            return Err(PreflightError::OutsideBaremetalSlot {
+                block: index,
+                start: address,
+                end,
+            });
         }
 
         expected_address = end;
@@ -135,7 +214,7 @@ pub fn preflight_bytes(bytes: &[u8]) -> Result<Uf2Image, SendError> {
     Ok(Uf2Image { blocks })
 }
 
-pub fn preflight_file(path: &Path) -> Result<Uf2Image, Box<dyn Error>> {
+pub fn preflight_file(path: &Path) -> Result<Uf2Image, ImageFileError> {
     Ok(preflight_bytes(&fs::read(path)?)?)
 }
 
@@ -143,47 +222,13 @@ pub trait ReplTransport: Read + Write {
     fn clear_input(&mut self) -> io::Result<()>;
 }
 
-pub struct SerialTransport {
-    port: Box<dyn serialport::SerialPort>,
-}
-
-impl SerialTransport {
-    pub fn open(path: &str, baud: u32, io_timeout: Duration) -> Result<Self, serialport::Error> {
-        Ok(Self {
-            port: serialport::new(path, baud).timeout(io_timeout).open()?,
-        })
-    }
-}
-
-impl Read for SerialTransport {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        self.port.read(buffer)
-    }
-}
-
-impl Write for SerialTransport {
-    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        self.port.write(buffer)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.port.flush()
-    }
-}
-
-impl ReplTransport for SerialTransport {
-    fn clear_input(&mut self) -> io::Result<()> {
-        self.port
-            .clear(serialport::ClearBuffer::Input)
-            .map_err(io::Error::other)
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct SendOptions {
     pub response_timeout: Duration,
     pub retries: u32,
     pub retry_delay: Duration,
+    /// Delay after duplicate byte-wise `localecho off` commands, before negotiation.
+    pub settle_delay: Duration,
 }
 
 impl Default for SendOptions {
@@ -192,6 +237,7 @@ impl Default for SendOptions {
             response_timeout: Duration::from_millis(500),
             retries: 3,
             retry_delay: Duration::from_millis(100),
+            settle_delay: Duration::from_millis(100),
         }
     }
 }
@@ -202,11 +248,62 @@ pub enum Protocol {
     Crc,
 }
 
+/// Successful protocol handling reported by boot1.
+///
+/// Some boot1 versions print `Write error` and then still print `Wrote`. Consequently, an
+/// acknowledged transfer confirms command handling, but does not prove that RRAM persisted it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransferReport {
     pub protocol: Protocol,
     pub blocks: usize,
     pub retries: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AckFailure {
+    Mismatch,
+    Timeout,
+}
+
+impl std::fmt::Display for AckFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Mismatch => "device returned a mismatched acknowledgment",
+            Self::Timeout => "timed out waiting for an exact acknowledgment",
+        })
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum SendError {
+    #[error("retries must be at least 1")]
+    InvalidRetries,
+    #[error("could not disable local echo: {0}")]
+    DisableEcho(#[source] io::Error),
+    #[error("CRC probe write failed: {0}")]
+    ProbeWrite(#[source] io::Error),
+    #[error("CRC probe read failed: {0}")]
+    ProbeRead(#[source] io::Error),
+    #[error("block {block} write failed: {source}")]
+    BlockWrite {
+        block: usize,
+        #[source]
+        source: io::Error,
+    },
+    #[error("block {block} read failed: {source}")]
+    BlockRead {
+        block: usize,
+        #[source]
+        source: io::Error,
+    },
+    #[error("block {block} failed after {attempts} attempts: {reason}")]
+    BlockFailed {
+        block: usize,
+        attempts: u32,
+        reason: AckFailure,
+    },
+    #[error("could not restore local echo: {0}")]
+    RestoreEcho(#[source] io::Error),
 }
 
 fn write_command(transport: &mut impl ReplTransport, command: &str) -> io::Result<()> {
@@ -258,13 +355,13 @@ pub fn negotiate_protocol(
     transport
         .clear_input()
         .and_then(|()| write_command(transport, "has-crc\r"))
-        .map_err(|error| SendError::new(format!("CRC probe failed: {error}")))?;
+        .map_err(SendError::ProbeWrite)?;
     let response = read_until(transport, timeout, |line| match line.trim() {
         "true" => Some(true),
         "false" => Some(false),
         _ => None,
     })
-    .map_err(|error| SendError::new(format!("CRC probe read failed: {error}")))?;
+    .map_err(SendError::ProbeRead)?;
     Ok(if response == Some(true) {
         Protocol::Crc
     } else {
@@ -305,6 +402,10 @@ fn set_echo(transport: &mut impl ReplTransport, enabled: bool) -> io::Result<()>
     Ok(())
 }
 
+/// Transfer a preflighted image and require an exact acknowledgment for every block.
+///
+/// An acknowledgment does not prove persistence: affected boot1 versions can print `Write error`
+/// and then `Wrote` after a failed RRAM write. Verify the resulting image independently.
 pub fn send_image(
     transport: &mut impl ReplTransport,
     image: &Uf2Image,
@@ -312,19 +413,18 @@ pub fn send_image(
     mut progress: impl FnMut(usize, usize),
 ) -> Result<TransferReport, SendError> {
     if options.retries == 0 {
-        return Err(SendError::new("retries must be at least 1"));
+        return Err(SendError::InvalidRetries);
     }
-    let protocol = negotiate_protocol(transport, options.response_timeout)?;
     if let Err(error) = set_echo(transport, false) {
         let _ = set_echo(transport, true);
-        return Err(SendError::new(format!(
-            "could not disable local echo: {error}"
-        )));
+        return Err(SendError::DisableEcho(error));
     }
+    thread::sleep(options.settle_delay);
 
     let transfer = (|| {
+        let protocol = negotiate_protocol(transport, options.response_timeout)?;
         let mut retry_count = 0;
-        for (index, block) in image.blocks.iter().enumerate() {
+        for (index, block) in image.iter().enumerate() {
             let encoded = STANDARD.encode(block.bytes);
             let crc = crc32fast::hash(&block.bytes);
             let command = match protocol {
@@ -335,8 +435,9 @@ pub fn send_image(
                 transport
                     .clear_input()
                     .and_then(|()| write_command(transport, &command))
-                    .map_err(|error| {
-                        SendError::new(format!("block {index} write failed: {error}"))
+                    .map_err(|source| SendError::BlockWrite {
+                        block: index,
+                        source,
                     })?;
                 let response = read_until(transport, options.response_timeout, |line| {
                     if line.starts_with("CRC error ") {
@@ -345,35 +446,39 @@ pub fn send_image(
                         parse_ack(line, block, protocol, crc)
                     }
                 })
-                .map_err(|error| SendError::new(format!("block {index} read failed: {error}")))?;
+                .map_err(|source| SendError::BlockRead {
+                    block: index,
+                    source,
+                })?;
                 if response == Some(true) {
                     retry_count += attempt - 1;
-                    progress(index + 1, image.blocks.len());
+                    progress(index + 1, image.len());
                     break;
                 }
-                let last_error = match response {
-                    Some(false) => "device returned a mismatched acknowledgment".to_owned(),
-                    None => "timed out waiting for an exact acknowledgment".to_owned(),
-                    Some(true) => unreachable!(),
+                let reason = if response == Some(false) {
+                    AckFailure::Mismatch
+                } else {
+                    AckFailure::Timeout
                 };
                 if attempt < options.retries {
                     thread::sleep(options.retry_delay);
                 } else {
-                    return Err(SendError::new(format!(
-                        "block {index} failed after {attempt} attempts: {last_error}"
-                    )));
+                    return Err(SendError::BlockFailed {
+                        block: index,
+                        attempts: attempt,
+                        reason,
+                    });
                 }
             }
         }
         Ok(TransferReport {
             protocol,
-            blocks: image.blocks.len(),
+            blocks: image.len(),
             retries: retry_count,
         })
     })();
 
-    let cleanup = set_echo(transport, true)
-        .map_err(|error| SendError::new(format!("could not restore local echo: {error}")));
+    let cleanup = set_echo(transport, true).map_err(SendError::RestoreEcho);
     match (transfer, cleanup) {
         (Err(error), _) => Err(error),
         (Ok(_), Err(error)) => Err(error),
@@ -485,25 +590,29 @@ mod tests {
         preflight_bytes(&block(0, 1, BAREMETAL_START)).unwrap()
     }
 
+    fn test_options() -> SendOptions {
+        SendOptions {
+            settle_delay: Duration::ZERO,
+            retry_delay: Duration::ZERO,
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn preflight_rejects_wrong_family_and_noncontiguous_blocks() {
         let mut wrong_family = block(0, 1, BAREMETAL_START);
         wrong_family[28..32].copy_from_slice(&0_u32.to_le_bytes());
-        assert!(
-            preflight_bytes(&wrong_family)
-                .unwrap_err()
-                .to_string()
-                .contains("family")
-        );
+        assert!(matches!(
+            preflight_bytes(&wrong_family),
+            Err(PreflightError::WrongFamily { .. })
+        ));
 
         let mut bytes = block(0, 2, BAREMETAL_START).to_vec();
         bytes.extend_from_slice(&block(1, 2, BAREMETAL_START + 512));
-        assert!(
-            preflight_bytes(&bytes)
-                .unwrap_err()
-                .to_string()
-                .contains("contiguous")
-        );
+        assert!(matches!(
+            preflight_bytes(&bytes),
+            Err(PreflightError::NonContiguousAddress { .. })
+        ));
 
         let blocks_in_slot = (BAREMETAL_END - BAREMETAL_START) / 256;
         let total = blocks_in_slot + 1;
@@ -511,25 +620,29 @@ mod tests {
         for number in 0..total {
             outside_slot.extend_from_slice(&block(number, total, BAREMETAL_START + number * 256));
         }
-        assert!(
-            preflight_bytes(&outside_slot)
-                .unwrap_err()
-                .to_string()
-                .contains("baremetal slot")
-        );
+        assert!(matches!(
+            preflight_bytes(&outside_slot),
+            Err(PreflightError::OutsideBaremetalSlot { .. })
+        ));
     }
 
     #[test]
     fn negotiates_crc_and_sends_exact_crc_command() {
+        let raw_block = block(0, 1, BAREMETAL_START);
+        let image = preflight_bytes(&raw_block).unwrap();
         let mut mock = MockBoot1 {
             crc: true,
             ..Default::default()
         };
-        let report = send_image(&mut mock, &image(), &SendOptions::default(), |_, _| {}).unwrap();
-        let writes = String::from_utf8(mock.writes).unwrap();
+        let report = send_image(&mut mock, &image, &test_options(), |_, _| {}).unwrap();
+        let encoded = STANDARD.encode(raw_block);
+        let crc = crc32fast::hash(&raw_block);
+        let expected = format!(
+            "localecho off\rlocalecho off\rhas-crc\ruf2 {encoded} {crc:08x}\rlocalecho on\r"
+        );
+
         assert_eq!(report.protocol, Protocol::Crc);
-        assert!(writes.contains("uf2 "));
-        assert!(writes.ends_with("localecho on\r"));
+        assert_eq!(String::from_utf8(mock.writes).unwrap(), expected);
     }
 
     #[test]
@@ -538,11 +651,7 @@ mod tests {
             fail_first_block: true,
             ..Default::default()
         };
-        let options = SendOptions {
-            retry_delay: Duration::ZERO,
-            ..Default::default()
-        };
-        let report = send_image(&mut mock, &image(), &options, |_, _| {}).unwrap();
+        let report = send_image(&mut mock, &image(), &test_options(), |_, _| {}).unwrap();
         assert_eq!(report.protocol, Protocol::Legacy);
         assert_eq!(report.retries, 1);
         assert!(mock.writes.ends_with(b"localecho on\r"));
@@ -557,7 +666,7 @@ mod tests {
         let options = SendOptions {
             retries: 1,
             response_timeout: Duration::from_millis(1),
-            ..Default::default()
+            ..test_options()
         };
         assert!(send_image(&mut mock, &image(), &options, |_, _| {}).is_err());
         assert!(mock.writes.ends_with(b"localecho on\r"));
