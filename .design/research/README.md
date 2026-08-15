@@ -27,5 +27,8 @@ Read `04-synthesis.md` first; the rest are its sources.
 - [`06-irq-ack-semantics.md`](06-irq-ack-semantics.md) — RTL-proven irqarray
   edge/level behavior, positive enable polarity, W1C ordering, lost-event
   constraints, Xous sequences, and the concrete Zephyr dispatch algorithm.
+- [`07-ticktimer-sysclock.md`](07-ticktimer-sysclock.md) — RTL-proven ticktimer
+  divider, coherent counter and target-commit semantics, direct IRQ mapping,
+  and the implementation and validation contract for Zephyr system time.
 
 Synced from `~/a/doc/bao/` 2026-08-14.
