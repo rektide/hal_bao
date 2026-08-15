@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 
 [workspace]
-members = ["tools/image"]
+members = ["tools/image", "tools/uf2send"]
 resolver = "2"
