@@ -1,7 +1,7 @@
 ---
 type: Research
 title: Baochip ticktimer system clock contract
-description: Corrected RTL-proven ticktimer register semantics and a 1 MHz Zephyr system-clock design.
+description: RTL-proven ticktimer semantics and the bounded, Verilator-validated 1 MHz Zephyr system clock.
 tags: [baochip, ticktimer, timer, sysclock, rtl, xous, zephyr]
 status: stable
 generated: { by: agent:opencode, at: 2026-08-14 }
@@ -15,17 +15,25 @@ sources:
   - id: zephyr-system-timer-api
     resource: https://github.com/zephyrproject-rtos/zephyr/blob/main/include/zephyr/drivers/timer/system_timer.h
     title: Zephyr system timer API
+  - id: zephyr-baochip-bounded-alarm
+    resource: urn:git:commit:09c0c221b34fc694e9a3a45877a04269421d48f2
+    title: Local Zephyr commit implementing bounded alarm programming
   - id: zephyr-baochip-takeover
-    resource: urn:git:commit:8be201703985d406f1e058cc783c188383fd0f0d
-    title: Local Zephyr commit implementing hardened Baochip ticktimer takeover
+    resource: urn:git:commit:5238ced66f59b9fc5694d88c2007d90817aad4e0
+    title: Local Zephyr tip implementing bounded Baochip ticktimer operations
+  - id: zephyr-baochip-runtime-overlay
+    resource: urn:git:commit:69c8bd9e46b27b25a785a1a44c767fc244a46b80
+    title: Local Zephyr runtime-test overlay routing output through DUART
 ---
 
 # Baochip ticktimer system clock contract
 
-This note closes the remaining design questions for `halbao-m2-sysclock`. The
-MMIO system timer at `0xe001b000` is implemented in the local Zephyr tree
-through commit `8be201703985` and has build-oriented driver and scheduling
-tests. It has not been validated in the RTL simulator or on hardware.
+This note records the final design and current evidence for
+`halbao-m2-sysclock`. The MMIO system timer at `0xe001b000` is implemented in
+the local Zephyr tree through commits `09c0c221b34f` (bounded alarm commits) and
+`5238ced66f59` (bounded counter reads). With the DUART test overlay in
+`69c8bd9e46b2`, both tickless and periodic kernel tests pass in the Baochip
+Verilator model. Hardware validation remains open.
 
 > **Correction, 2026-08-14:** The initial version incorrectly configured the
 > hardware counter itself for 1 kHz and attempted to preserve its inherited
@@ -122,12 +130,26 @@ Bounded coherent reads also prevent early boot from hanging forever if CDC or
 the counter is not operating.
 
 `TIME1` and `TIME0` are independent views, not an atomic read latch. Read
-high-low-high and retry if the high words differ:
+high-low-high and retry if the high words differ, but bound the operation to
+three attempts:
 
 ```text
-do { hi0 = TIME1; lo = TIME0; hi1 = TIME1; } while (hi0 != hi1)
-return (hi1 << 32) | lo
+repeat at most 3 times:
+    hi0 = TIME1; lo = TIME0; hi1 = TIME1
+    if hi0 == hi1: return (hi1 << 32) | lo, coherent=true
+return (latest hi1 << 32), coherent=false
 ```
+
+On exhaustion, each mismatch proves that the counter reached the corresponding
+`hi1` epoch. Returning the latest observed high word with a zero low word is
+therefore a conservative floor for that latest epoch; it avoids combining a
+new high word with a stale pre-rollover low word. At 1 MHz, the 32-bit low word
+rolls only every `2^32 us`, or 4,294.967296 seconds (71 minutes 34.967296
+seconds), so three consecutive rollover-window mismatches require pathological
+CDC timing or multiple high-epoch advances during this short function. The
+read uses only MMIO samples and local variables: it needs no software lock,
+atomic operation, or mutable cross-call state. Takeover still accepts only a
+result marked coherent when proving the nonzero-to-zero reset sequence.
 
 Program a target high word first and low word last. RTL makes only the low-word
 write assert `msleep_target_re`, which starts transfer and temporarily locks out
@@ -137,7 +159,8 @@ the system-domain alarm until the round trip completes
 
 The comparator is `target <= time`, so an expired target remains asserted; a
 pending clear alone immediately reasserts. Every arm or rearm must order MMIO
-and then prove that the committed target is still future:
+and check whether the committed target is still future. This operation is
+bounded to three commits:
 
 ```text
 EV_ENABLE = 0
@@ -147,21 +170,25 @@ MSLEEP_TARGET0 = target              # commit
 full data-synchronization fence       # target transfer precedes pending clear
 EV_PENDING = 1                       # W1C stale level
 full data-synchronization fence
-now = coherent TIME read             # mandatory after transfer and W1C
-if target is not future:
-    target = next absolute tick boundary after now
-    repeat commit, clear, and coherent TIME recheck
+now = bounded TIME read              # mandatory after transfer and W1C
+if target is not future and attempts remain:
+    elapsed = floor((now - last_count) / CYC_PER_TICK)
+    target = last_count + (elapsed + 2) * CYC_PER_TICK
+    repeat commit, clear, and TIME recheck, for at most 3 total commits
 full data-synchronization fence
-EV_ENABLE = 1                        # only for a rechecked future target
+EV_ENABLE = 1                        # future target, or expired third-target fallback
 full data-synchronization fence
 ```
 
 The recheck closes the time-of-check/time-of-use window in which a deadline can
 expire while the target crosses domains or while stale pending state is
-cleared. Recommitment uses the next absolute boundary relative to `last_count`,
-not `now + CYC_PER_TICK`, so late programming catches up without introducing
-phase drift. The implementation checks again immediately before enable and
-repeats the same commit/recheck operation if that final window also expired.
+cleared. A retry retains the absolute phase relative to `last_count` and adds a
+two-tick margin beyond the elapsed boundary, rather than using `now +
+CYC_PER_TICK`, so late programming catches up without introducing phase drift
+and has room for the CDC round trip. If all three targets expire, the driver
+still enables the final expired target. Because the comparator is level
+sensitive, that target requests a prompt catch-up IRQ instead of hanging in a
+retry loop with the event disabled; this is the bounded liveness fallback.
 The underlying disable, reprogram, clear, enable ordering is proven by Xous
 ([`implementation.rs:208-228`](https://github.com/betrusted-io/xous-core/blob/5d5bbbfa95c0dcef26fe1fe9b496b7f6f31d191b/services/xous-ticktimer/src/platform/bao1x/implementation.rs#L208-L228)).
 The interrupt is CPU external line 20. In the port's flattened namespace direct
@@ -190,11 +217,13 @@ Initialization must order ownership and the first alarm as follows:
 4. Pulse CONTROL.RESET again; bounded-poll coherent TIME until synchronized zero,
    then write CONTROL = 0 and set last_count = 0. Fail initialization with
    `-ETIMEDOUT` if either observation cannot be made.
-5. Commit a future target with EV_ENABLE still zero, clear EV_PENDING, and
-   coherently recheck TIME; recommit the next absolute tick if it expired.
+5. Commit a target with EV_ENABLE still zero, clear EV_PENDING, and recheck
+   TIME; on expiry retry with the absolute two-tick margin, for at most three
+   commits.
 6. Connect and enable direct IRQ 356.
-7. Recheck again and set EV_ENABLE = 1 only while the target is future and the
-   IRQ is ready.
+7. Set EV_ENABLE = 1 after the IRQ is ready. Normally the committed target is
+   future; after three expiries the final expired level target deliberately
+   produces the catch-up IRQ.
 ```
 
 The first target is `last_count + CYC_PER_TICK`, one Zephyr tick boundary. This
@@ -220,10 +249,11 @@ kernel tick rate. The 350 MHz input-clock rate appears only in divider
 derivation and validation; it must never enter timeout, elapsed, baseline, or
 target arithmetic.
 
-- `sys_clock_cycle_get_64()` returns the coherent raw count;
-  `sys_clock_cycle_get_32()` returns its low word. Select
+- `sys_clock_cycle_get_64()` returns the coherent raw count when available; if
+  all three high-low-high attempts mismatch, it returns the conservative latest
+  high-epoch floor. `sys_clock_cycle_get_32()` returns its low word. Select
   `TIMER_HAS_64BIT_CYCLE_COUNTER` and `SYSTEM_CLOCK_LOCK_FREE_COUNT` because
-  high-low-high needs no mutable software state.
+  the bounded read needs no mutable software state, lock, or atomic operation.
 - `sys_clock_elapsed()` returns `floor((now - last_count) / CYC_PER_TICK)`
   in tickless mode and zero in periodic mode.
 - The ISR's first hardware action is `EV_ENABLE = 0`. It then obtains
@@ -241,10 +271,11 @@ target arithmetic.
   after applying the maximum-span clamp; thus a zero request and any target no
   longer in the future select the next tick boundary.
 - Target programming is not complete at the low-word write. After target
-  transfer and pending clear, the driver must coherently reread `TIME`. If the
-  target is no longer future, it recommits the next absolute tick boundary and
-  repeats until the committed target survives the recheck. It performs another
-  coherent check immediately before enabling the alarm.
+  transfer and pending clear, the driver rereads `TIME`. If the target is no
+  longer future, it recommits an absolute boundary with a two-tick margin. It
+  makes at most three commit/read attempts; if the third target is also
+  expired, enabling that level target forces a prompt catch-up IRQ for
+  liveness.
 - After updating `last_count`, the ISR calls
   `sys_clock_announce_locked(dticks, key)` with `EV_ENABLE` still zero. Current
   Zephyr then calls `sys_clock_set_timeout()` from its post-announce
@@ -262,12 +293,13 @@ target arithmetic.
   absolute one-tick target does not accumulate drift.
 
 All arithmetic involving absolute targets and the baseline is unsigned 64-bit.
-An arm whose computed target is no longer in the future must select the next
-safe tick boundary rather than enabling an already-high comparator.
+An expired arm selects a margin-bearing absolute boundary while attempts
+remain; only exhaustion deliberately enables the already-high comparator.
 
-## Implementation status
+## Implementation and runtime status
 
-The implementation is in the local Zephyr tree through commit `8be201703985`:
+The implementation is in the local Zephyr tree through commit `5238ced66f59`,
+with runtime overlay `69c8bd9e46b2`:
 
 - `drivers/timer/baochip_ticktimer.c`: MMIO, coherent reads, alarm sequencing,
   locked accounting, ISR, and `SYS_INIT(... PRE_KERNEL_2,
@@ -283,21 +315,52 @@ The implementation is in the local Zephyr tree through commit `8be201703985`:
   `clock-frequency = <350000000>`, and `<356>` interrupt through `&intc`.
 - Baochip SoC Kconfig/defconfig: `SYS_CLOCK_EXISTS=y`, 1 MHz hardware-cycle
   rate, `SYS_CLOCK_TICKS_PER_SEC=1000`, and no RISC-V machine timer.
+- `09c0c221b34f`: limits alarm programming to three attempts, gives expired
+  retries an absolute two-tick margin, and uses the final expired level target
+  as the liveness IRQ fallback.
+- `5238ced66f59`: limits high-low-high counter reads to three attempts and
+  returns the conservative latest high-epoch floor on exhaustion; native logic
+  tests cover immediate coherence, rollover then coherence, bounded exhaustion,
+  and unsigned 64-bit wrap.
+- `69c8bd9e46b2`: routes this test's console to the simulated DUART, making the
+  kernel result observable in Verilator.
 
-The driver is implemented and build-tested through tickless and periodic Dabao
-test configurations plus native logic tests for timeout limits,
-late/post-program expiry, and counter wrap. This is build-level evidence only.
-No Verilator or hardware result is recorded, so runtime correctness remains
-unvalidated at those layers.
+The preserved evidence is under
+`/tmp/opencode/halbao-final-kernel-runtime/{tickless-final,periodic-final}`. Both
+configurations boot Zephyr 4.4.99, run
+`baochip_ticktimer.test_timekeeping_and_preemption`, report `PASS` in exactly
+`0.019 seconds`, emit `TESTSUITE baochip_ticktimer succeeded`, and finish with
+`PROJECT EXECUTION SUCCESSFUL`. The simulator process was externally timed out
+only after ztest success, as recorded by `simulator_note=timeout_after_ztest_success`
+and `result=PASS` in each `status.txt`.
+
+The test sleeps for 12 ms and asserts that uptime advanced by at least 12 ms and
+that both 32-bit and 64-bit cycle counters progressed. It then runs a busy
+lower-priority thread while a higher-priority thread sleeps for 5 ms; the test
+requires the timer wakeup to preempt the busy thread and signal within 100 ms.
+For both images, generated devicetree selects IRQ 356 and the ISR table links
+the timer handler at entry 356. Since no alternate system timer is configured,
+successful sleep deadlines and timer-driven preemption establish that direct
+IRQ 356 also fired, not merely that it linked.
+
+This runtime evidence proves the integrated nominal path in the RTL model:
+takeover completed, time and cycles advanced, `k_sleep()` did not return before
+its deadline, scheduling preemption occurred, and direct IRQ 356 was linked and
+serviced in both kernel modes. It does **not** inject CDC faults, force a
+`TIME0` rollover during a read, force all three alarm commits to expire, measure
+long-duration drift, exercise interrupt-load extremes, or substitute for
+hardware measurements. The native logic tests establish the bounded fallback
+algorithms for those synthetic cases, not their physical incidence.
 
 ## Validation matrix
 
 | Layer | Required evidence |
 |---|---|
 | Build | Dabao builds in tickless and `CONFIG_TICKLESS_KERNEL=n` configurations; devicetree reports base, size, frequency, and IRQ 356; no CLINT/machine-timer driver is linked. |
-| Unit/native logic | Divider calculation yields 349; `CYC_PER_TICK` is 1000; all formulas use counter cycles; target split is high then low; rollover reads retry; timeout arithmetic covers zero, one, maximum wait, wrap, late ISR, post-program expiry, and elapsed-before-rearm. |
-| Verilator | Counter advances once per 350 input clocks; bounded nonzero-then-zero takeover proves divider-before-reset ordering; either missing observation returns `-ETIMEDOUT`; no pre-reset count becomes the baseline; IRQ 356 dispatches directly; target transfer does not glitch; post-commit expiry causes an absolute-boundary recommit; W1C while target is expired reasserts; startup never enables target zero; ISR leaves the event disabled until the kernel reprograms it; delayed ISR catches up in tickless and periodic modes. |
-| Hardware | `k_cycle_get_64()` and `k_uptime_get()` are monotonic; measured uptime/sleep drift is bounded over a long interval; `k_sleep()` covers one and many ticks; tickless idle wakes at deadlines; periodic mode remains stable under interrupt load and around `TIME0` rollover. |
+| Unit/native logic | Divider calculation yields 349; `CYC_PER_TICK` is 1000; all formulas use counter cycles; target split is high then low; counter reads and alarm commits stop after three attempts; tests cover coherent reads, rollover retry, conservative floor and unsigned-wrap fallbacks, absolute two-tick-margin retries, final expired-target fallback, zero/one/maximum timeouts, late ISR, and elapsed-before-rearm. |
+| Verilator, observed | Tickless and periodic images each emit `PROJECT EXECUTION SUCCESSFUL`; the sole ztest passes in 0.019 s. Its assertions establish a 12 ms `k_sleep()` deadline, uptime and 32/64-bit cycle progression, and timer wakeup preemption. Build artifacts link the sole system timer's direct ISR at IRQ 356, and successful timer-dependent completion establishes that it fires. |
+| Verilator, still open | Inject CDC faults; force `TIME0` rollover during high-low-high reads; force three consecutive alarm-commit expiries and observe the level-IRQ fallback; verify exact divide-by-350 cadence, target-transfer/W1C edge cases, delayed-ISR catch-up, and sustained interrupt load independently of the nominal kernel test. |
+| Hardware, still open | Confirm monotonic cycles/uptime and direct IRQ behavior on silicon; measure long-interval uptime/sleep drift; cover one- and many-tick sleeps, tickless idle, periodic interrupt load, `TIME0` rollover, CDC behavior, and clock-policy assumptions. |
 
 ## Risks and boundaries
 
@@ -308,8 +371,10 @@ unvalidated at those layers.
 - Target transfer crosses clock domains and has documented approximately 200
   ns slip. Tests need tolerance; software must not busy-wait for exact equality.
 - The level comparator makes ordering correctness mandatory. Enabling before a
-  future target has committed and survived the coherent post-clear recheck can
-  create an immediate interrupt storm.
+  target commit and pending clear can create an unintended interrupt storm.
+  The bounded algorithm's final expired target is a deliberate exception: it
+  requests one prompt catch-up service for liveness, after which normal kernel
+  reprogramming runs again.
 - Reprogramming `CLOCKS_PER_TICK` does not reset the current prescaler. The
   required reset after divider programming is what establishes the exact first
   1 MHz counter interval and the trustworthy zero epoch.
