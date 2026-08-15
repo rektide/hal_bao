@@ -42,15 +42,22 @@ response selects CRC commands and exact size/address/CRC acknowledgments;
 acknowledgments. CRC errors, mismatches, and timeouts are retried only up to the
 configured attempt limit. Local echo is restored on success or failure.
 
-The sender detects a reported `Write error` while awaiting an acknowledgment
-and fails the transfer immediately, even when affected boot1 versions print a
-syntactically valid `Wrote` line afterward. An accepted `Wrote` acknowledgment
-still cannot independently prove persistence: power loss and silent corruption
-remain possible, so verify the installed image independently.
+An accepted `Wrote` acknowledgment means only that boot1 parsed the command and
+returned the expected framing. Current stock boot1 sends an RRAM `Write error`
+through DUART-only `print_d!`, which is not the USB/UART REPL transport, and
+then unconditionally sends `Wrote` on the REPL. Stock boot1 can therefore
+acknowledge failed persistence, and this sender cannot detect that failure.
+After transfer, run boot1 `audit` to validate the persisted next-stage image,
+then validate an actual boot before treating the update as installed.
+
+The sender retains fail-fast handling for a `Write error` received in-band from
+boot1 versions that provide one. The minimal upstream protocol fix is to emit
+the RRAM write error on the active REPL and suppress `Wrote` when the write
+fails; a regression should exercise both legacy and CRC commands. See the
+[`manual validation guide`](/doc/bringup/manual-validation.md) for the stock
+source references and required checks.
 
 Hold PROG to remain in boot1. A developer-signed image can irreversibly enter
 developer mode and erase device secrets; inspect the device with `audit`
 before transfer. Host preflight cannot determine key revocation,
-anti-rollback, or require-PQ state. See the
-[`manual validation guide`](/doc/bringup/manual-validation.md) for lifecycle
-checks and recovery.
+anti-rollback, or require-PQ state.

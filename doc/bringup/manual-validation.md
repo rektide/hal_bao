@@ -49,11 +49,23 @@ do not remain available after boot1 hands control to Zephyr.
 
 The `bao-uf2send` tool sends the same UF2 over the boot1 REPL with per-block
 acknowledgments and retries. Its reusable `bao-boot1-protocol` crate validates
-the complete canonical image before transfer. It treats a reported boot1
-`Write error` as a transfer failure even if followed by `Wrote`. A `Wrote`
-acknowledgment confirms protocol handling, not persistence; power loss and
-silent corruption remain possible. Independently verify the installed image
-before treating the update as durable.
+the complete canonical image before transfer. A `Wrote` acknowledgment confirms
+command parsing only, not persistence. Current stock boot1 emits RRAM `Write
+error` through DUART-only `print_d!`, then unconditionally emits `Wrote` on the
+actual USB/UART REPL, so it can acknowledge failed persistence and the sender
+cannot detect that stock failure. The sender still fails if another boot1
+version reports `Write error` in-band. Always perform the post-write audit and
+boot validation below.
+
+The primary source is stock xous-core revision
+`5d5bbbfa95c0dcef26fe1fe9b496b7f6f31d191b`: both the
+[`legacy REPL write path`](https://github.com/betrusted-io/xous-core/blob/5d5bbbfa95c0dcef26fe1fe9b496b7f6f31d191b/bao1x-boot/boot1/src/repl.rs#L186-L193)
+and the
+[`CRC REPL write path`](https://github.com/betrusted-io/xous-core/blob/5d5bbbfa95c0dcef26fe1fe9b496b7f6f31d191b/bao1x-boot/boot1/src/repl.rs#L279-L290)
+have this behavior, while
+[`print_d!` writes to `Duart`](https://github.com/betrusted-io/xous-core/blob/5d5bbbfa95c0dcef26fe1fe9b496b7f6f31d191b/bao1x-boot/boot1/src/platform/bao1x/debug.rs#L153-L188).
+The minimal upstream protocol fix is to report the write error on the active
+REPL and suppress `Wrote` on failure, with legacy and CRC regression coverage.
 
 The package boundary is intentional: `bao-boot1-protocol` is the reusable,
 transport-independent validation and REPL protocol library;
@@ -215,10 +227,16 @@ acknowledgments when available, and otherwise uses legacy acknowledgments. It
 requires an exact acknowledgment and makes at most three attempts per block by
 default; `--timeout-ms`, `--settle-ms`, and `--retries` adjust those bounds.
 This does not replace the earlier `audit`: host validation cannot establish
-device key, anti-rollback, or PQ policy. It fails when boot1 reports `Write
-error`, including when a misleading `Wrote` line follows, but an acknowledgment
-cannot independently prove persistence against power loss or silent corruption.
-Verify installation before treating serial transfer as durable.
+device key, anti-rollback, or PQ policy. A `Wrote` ACK establishes command
+parsing only. Stock boot1's RRAM failure is DUART-only and therefore invisible
+to the sender even though stock boot1 acknowledges the block. A different
+boot1 that reports `Write error` in-band will fail the transfer immediately.
+
+After the serial transfer, remain in or re-enter boot1 and run `audit` again.
+Save its complete output and require `Next stage` validation to report the
+expected signed image without errors. Then perform the boot checks under
+**Expected result**. Both checks are required before treating the serial
+transfer as installed.
 
 1. Confirm that exactly one FAT volume has label `BAOCHIP`.
 2. Confirm that the selected mount is not labeled `ALTCHIP`.

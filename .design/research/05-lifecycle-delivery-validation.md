@@ -12,6 +12,12 @@ sources:
   - id: xous-boot1
     resource: https://github.com/betrusted-io/xous-core/tree/dev/bao1x-boot/boot1
     title: Baochip boot1 source
+  - id: xous-boot1-repl-write
+    resource: https://github.com/betrusted-io/xous-core/blob/5d5bbbfa95c0dcef26fe1fe9b496b7f6f31d191b/bao1x-boot/boot1/src/repl.rs#L186-L193
+    title: Baochip boot1 legacy REPL RRAM write path
+  - id: xous-boot1-duart
+    resource: https://github.com/betrusted-io/xous-core/blob/5d5bbbfa95c0dcef26fe1fe9b496b7f6f31d191b/bao1x-boot/boot1/src/platform/bao1x/debug.rs#L153-L188
+    title: Baochip boot1 DUART-only debug output
   - id: dabao-hardware
     resource: https://github.com/baochip/dabao
     title: Dabao hardware design
@@ -176,12 +182,22 @@ so at the protocol level rather than leaving serial upload unintegrated.
 
 The current sender preflights the entire image before opening a port, probes
 `has-crc`, requires exact size/address acknowledgments (and CRC when supported),
-and bounds attempts per block. These host guarantees do not supersede boot1
-`audit`, which remains necessary for device-local key, anti-rollback, and PQ
-policy. The sender now fails on a reported `Write error` even when affected
-boot1 versions subsequently print `Wrote`. Acknowledgments still do not
-independently prove RRAM persistence against power loss or silent corruption,
-so installation needs independent verification.
+and bounds attempts per block. ACK means command parsing only. In stock boot1's
+[`legacy path`](https://github.com/betrusted-io/xous-core/blob/5d5bbbfa95c0dcef26fe1fe9b496b7f6f31d191b/bao1x-boot/boot1/src/repl.rs#L186-L193)
+and
+[`CRC path`](https://github.com/betrusted-io/xous-core/blob/5d5bbbfa95c0dcef26fe1fe9b496b7f6f31d191b/bao1x-boot/boot1/src/repl.rs#L279-L290),
+RRAM failures use DUART-only
+[`print_d!`](https://github.com/betrusted-io/xous-core/blob/5d5bbbfa95c0dcef26fe1fe9b496b7f6f31d191b/bao1x-boot/boot1/src/platform/bao1x/debug.rs#L153-L188)
+and `Wrote` is emitted unconditionally on the active REPL. Stock boot1 can thus
+acknowledge failed persistence, which the sender cannot detect. The sender
+retains `SendError::DeviceWrite` for boot1 versions that report an in-band
+error. The minimal upstream fix is to emit the write error on the active REPL
+and suppress `Wrote` on failure, with legacy and CRC regression coverage.
+
+These host guarantees do not supersede boot1 `audit`, which remains necessary
+for device-local key, anti-rollback, PQ policy, and post-write next-stage
+validation. A successful boot must also be observed before installation is
+accepted.
 
 ## Cross-references
 
