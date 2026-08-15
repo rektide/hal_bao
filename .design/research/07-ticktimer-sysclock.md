@@ -15,13 +15,17 @@ sources:
   - id: zephyr-system-timer-api
     resource: https://github.com/zephyrproject-rtos/zephyr/blob/main/include/zephyr/drivers/timer/system_timer.h
     title: Zephyr system timer API
+  - id: zephyr-baochip-takeover
+    resource: urn:git:commit:8be201703985d406f1e058cc783c188383fd0f0d
+    title: Local Zephyr commit implementing hardened Baochip ticktimer takeover
 ---
 
 # Baochip ticktimer system clock contract
 
-This note closes the remaining design questions for `halbao-m2-sysclock`. It
-specifies an MMIO system timer at `0xe001b000`; it does not claim that the
-driver has been implemented or validated.
+This note closes the remaining design questions for `halbao-m2-sysclock`. The
+MMIO system timer at `0xe001b000` is implemented in the local Zephyr tree
+through commit `8be201703985` and has build-oriented driver and scheduling
+tests. It has not been validated in the RTL simulator or on hardware.
 
 > **Correction, 2026-08-14:** The initial version incorrectly configured the
 > hardware counter itself for 1 kHz and attempted to preserve its inherited
@@ -41,7 +45,7 @@ The block has nine 32-bit registers. Offsets and fields agree with generated
 
 | Offset | Register | Access | Semantics |
 |---:|---|---|---|
-| `0x00` | `CONTROL` | RW pulse | Bit 0 `RESET`; a write of 1 emits one reset request across the clock domain, zeroing `TIME` and loading the prescaler from `CLOCKS_PER_TICK`. Follow it with a write of 0, as Xous does, to leave the CSR storage deasserted. |
+| `0x00` | `CONTROL` | RW pulse | Bit 0 `RESET`; `CSRField(..., pulse=True)` makes a write of 1 generate a one-cycle source-domain pulse, which `BlindTransfer` carries into the always-on domain. The destination pulse zeros `TIME` and loads the prescaler from `CLOCKS_PER_TICK`; it is not a persistent reset level. The takeover sequence writes 0 only after reset has been proved. |
 | `0x04` | `TIME1` | RO | `TIME[63:32]`, synchronized into the CPU clock domain. |
 | `0x08` | `TIME0` | RO | `TIME[31:0]`. |
 | `0x0c` | `MSLEEP_TARGET1` | RW | Comparator target high word; updates storage only. |
@@ -73,29 +77,49 @@ Xous writes 350000
 be copied into this 1 MHz Zephyr design.
 
 Divider programming does not alter the live prescaler. Reset is therefore part
-of divider ownership, not optional epoch cleanup. RTL gives reset priority,
-sets `TIME = 0`, and loads the prescaler from the new `CLOCKS_PER_TICK`
+of divider ownership, not optional epoch cleanup. RTL defines `CONTROL.RESET`
+as pulse-on-write and sends that pulse through `BlindTransfer`; in the
+always-on domain reset has priority, sets `TIME = 0`, and loads the prescaler
+from the new `CLOCKS_PER_TICK`
 ([`bao_core.py:1821-1853`](https://github.com/baochip/baochip-1x/blob/83b220f790e7e846a6500264b480b42ad9ebd40b/verilate/bao_core.py#L1821-L1853)).
-The exact sequence is:
+`BlindTransfer` suppresses another source pulse until the destination pulse has
+been acknowledged
+([`cdc.py:140-177`](https://github.com/baochip/baochip-1x/blob/83b220f790e7e846a6500264b480b42ad9ebd40b/rtl/scripts/headergen/migen/genlib/cdc.py#L140-L177)).
+The implemented takeover is therefore bounded and deliberately uses two reset
+pulses:
 
 ```text
 EV_ENABLE = 0
+full data-synchronization fence
 CLOCKS_PER_TICK = 349
-CONTROL = 1                       # one reset pulse through BlindTransfer
-CONTROL = 0                       # leave pulse CSR storage deasserted
-poll coherent TIME until TIME == 0
-last_count = 0                    # baseline is trusted only after observed zero
+full data-synchronization fence
+CONTROL = RESET                   # first pulse through BlindTransfer
+full data-synchronization fence
+poll bounded coherent TIME reads until TIME != 0; else return -ETIMEDOUT
+CONTROL = RESET                   # second pulse, after transfer progress
+full data-synchronization fence
+poll bounded coherent TIME reads until TIME == 0; else return -ETIMEDOUT
+CONTROL = 0
+full data-synchronization fence
+last_count = 0                    # trusted only after the second observed reset
+full data-synchronization fence
 ```
 
-The zero observation is safe rather than a guessed delay. Reset leaves `TIME`
-at zero while the 350-input-clock prescaler counts down. The RTL
-`BusSynchronizer` refreshes the CPU-domain `TIME` view through a recurring
-handshake with a 128-input-domain-cycle timeout
-([`cdc.py:100-138`](https://github.com/baochip/baochip-1x/blob/83b220f790e7e846a6500264b480b42ad9ebd40b/rtl/scripts/headergen/migen/genlib/cdc.py#L100-L138)),
-so the synchronized view refreshes within the 350-clock zero interval. A
-pre-reset or merely post-write read is not a valid baseline; only observing the
-synchronized zero proves that reset has crossed domains and the new divider's
-epoch is visible.
+An immediate zero after the first write proves nothing: it can be a stale
+synchronized zero inherited from boot. The first bounded phase instead obtains
+a synchronized nonzero sample after programming the divider and issuing the
+first pulse. It then issues the second pulse and waits for a synchronized zero,
+which cannot be the previously observed sample. Because the fences order the
+divider write before both reset requests, the nonzero-to-zero observation
+proves that a reset crossed after divider ownership, even if `BlindTransfer`
+coalesces closely spaced pulse requests. It does not rely on identifying which
+request produced the observed reset, an old epoch, or assumed MMIO write order.
+Reset leaves `TIME` at zero while the
+350-input-clock prescaler counts down; the recurring `BusSynchronizer`
+handshake refreshes the CPU-domain view during that interval
+([`cdc.py:100-138`](https://github.com/baochip/baochip-1x/blob/83b220f790e7e846a6500264b480b42ad9ebd40b/rtl/scripts/headergen/migen/genlib/cdc.py#L100-L138)).
+Bounded coherent reads also prevent early boot from hanging forever if CDC or
+the counter is not operating.
 
 `TIME1` and `TIME0` are independent views, not an atomic read latch. Read
 high-low-high and retry if the high words differ:
@@ -112,17 +136,33 @@ the system-domain alarm until the round trip completes
 [`bao_core.py:1876-1907`](https://github.com/baochip/baochip-1x/blob/83b220f790e7e846a6500264b480b42ad9ebd40b/verilate/bao_core.py#L1876-L1907)).
 
 The comparator is `target <= time`, so an expired target remains asserted; a
-pending clear alone immediately reasserts. Every arm or rearm must be:
+pending clear alone immediately reasserts. Every arm or rearm must order MMIO
+and then prove that the committed target is still future:
 
 ```text
 EV_ENABLE = 0
+full data-synchronization fence
 MSLEEP_TARGET1 = target >> 32
 MSLEEP_TARGET0 = target              # commit
+full data-synchronization fence       # target transfer precedes pending clear
 EV_PENDING = 1                       # W1C stale level
-EV_ENABLE = 1
+full data-synchronization fence
+now = coherent TIME read             # mandatory after transfer and W1C
+if target is not future:
+    target = next absolute tick boundary after now
+    repeat commit, clear, and coherent TIME recheck
+full data-synchronization fence
+EV_ENABLE = 1                        # only for a rechecked future target
+full data-synchronization fence
 ```
 
-The same disable, reprogram, clear, enable ordering is proven by Xous
+The recheck closes the time-of-check/time-of-use window in which a deadline can
+expire while the target crosses domains or while stale pending state is
+cleared. Recommitment uses the next absolute boundary relative to `last_count`,
+not `now + CYC_PER_TICK`, so late programming catches up without introducing
+phase drift. The implementation checks again immediately before enable and
+repeats the same commit/recheck operation if that final window also expired.
+The underlying disable, reprogram, clear, enable ordering is proven by Xous
 ([`implementation.rs:208-228`](https://github.com/betrusted-io/xous-core/blob/5d5bbbfa95c0dcef26fe1fe9b496b7f6f31d191b/services/xous-ticktimer/src/platform/bao1x/implementation.rs#L208-L228)).
 The interrupt is CPU external line 20. In the port's flattened namespace direct
 IRQs start at 336, making the DTS IRQ **356** (`336 + 20`); it must bypass all
@@ -145,12 +185,16 @@ Initialization must order ownership and the first alarm as follows:
 
 ```text
 1. EV_ENABLE = 0.
-2. Program CLOCKS_PER_TICK = 349.
-3. Write CONTROL = 1, then CONTROL = 0.
-4. Poll coherent TIME until zero is observed; set last_count = 0 only then.
-5. Program a future target with EV_ENABLE still zero; clear EV_PENDING.
+2. Fence, program CLOCKS_PER_TICK = 349, and fence again.
+3. Pulse CONTROL.RESET; bounded-poll coherent TIME until a nonzero sample.
+4. Pulse CONTROL.RESET again; bounded-poll coherent TIME until synchronized zero,
+   then write CONTROL = 0 and set last_count = 0. Fail initialization with
+   `-ETIMEDOUT` if either observation cannot be made.
+5. Commit a future target with EV_ENABLE still zero, clear EV_PENDING, and
+   coherently recheck TIME; recommit the next absolute tick if it expired.
 6. Connect and enable direct IRQ 356.
-7. Set EV_ENABLE = 1 only after the target is committed and the IRQ is ready.
+7. Recheck again and set EV_ENABLE = 1 only while the target is future and the
+   IRQ is ready.
 ```
 
 The first target is `last_count + CYC_PER_TICK`, one Zephyr tick boundary. This
@@ -196,6 +240,11 @@ target arithmetic.
   `target = last_count + max(elapsed + ticks, elapsed + 1) * CYC_PER_TICK`,
   after applying the maximum-span clamp; thus a zero request and any target no
   longer in the future select the next tick boundary.
+- Target programming is not complete at the low-word write. After target
+  transfer and pending clear, the driver must coherently reread `TIME`. If the
+  target is no longer future, it recommits the next absolute tick boundary and
+  repeats until the committed target survives the recheck. It performs another
+  coherent check immediately before enabling the alarm.
 - After updating `last_count`, the ISR calls
   `sys_clock_announce_locked(dticks, key)` with `EV_ENABLE` still zero. Current
   Zephyr then calls `sys_clock_set_timeout()` from its post-announce
@@ -216,9 +265,9 @@ All arithmetic involving absolute targets and the baseline is unsigned 64-bit.
 An arm whose computed target is no longer in the future must select the next
 safe tick boundary rather than enabling an already-high comparator.
 
-## Integration plan
+## Implementation status
 
-The implementation belongs in the Zephyr tree, not this repository:
+The implementation is in the local Zephyr tree through commit `8be201703985`:
 
 - `drivers/timer/baochip_ticktimer.c`: MMIO, coherent reads, alarm sequencing,
   locked accounting, ISR, and `SYS_INIT(... PRE_KERNEL_2,
@@ -235,13 +284,19 @@ The implementation belongs in the Zephyr tree, not this repository:
 - Baochip SoC Kconfig/defconfig: `SYS_CLOCK_EXISTS=y`, 1 MHz hardware-cycle
   rate, `SYS_CLOCK_TICKS_PER_SEC=1000`, and no RISC-V machine timer.
 
+The driver is implemented and build-tested through tickless and periodic Dabao
+test configurations plus native logic tests for timeout limits,
+late/post-program expiry, and counter wrap. This is build-level evidence only.
+No Verilator or hardware result is recorded, so runtime correctness remains
+unvalidated at those layers.
+
 ## Validation matrix
 
 | Layer | Required evidence |
 |---|---|
 | Build | Dabao builds in tickless and `CONFIG_TICKLESS_KERNEL=n` configurations; devicetree reports base, size, frequency, and IRQ 356; no CLINT/machine-timer driver is linked. |
-| Unit/native logic | Divider calculation yields 349; `CYC_PER_TICK` is 1000; all formulas use counter cycles; target split is high then low; rollover reads retry; timeout arithmetic covers zero, one, maximum wait, wrap, late ISR, and elapsed-before-rearm. |
-| Verilator | Counter advances once per 350 input clocks; divider-before-reset produces an observed synchronized zero; no pre-reset count becomes the baseline; IRQ 356 dispatches directly; target transfer does not glitch; W1C while target is expired reasserts; startup never enables target zero; ISR leaves the event disabled until the kernel reprograms it; delayed ISR catches up in tickless and periodic modes. |
+| Unit/native logic | Divider calculation yields 349; `CYC_PER_TICK` is 1000; all formulas use counter cycles; target split is high then low; rollover reads retry; timeout arithmetic covers zero, one, maximum wait, wrap, late ISR, post-program expiry, and elapsed-before-rearm. |
+| Verilator | Counter advances once per 350 input clocks; bounded nonzero-then-zero takeover proves divider-before-reset ordering; either missing observation returns `-ETIMEDOUT`; no pre-reset count becomes the baseline; IRQ 356 dispatches directly; target transfer does not glitch; post-commit expiry causes an absolute-boundary recommit; W1C while target is expired reasserts; startup never enables target zero; ISR leaves the event disabled until the kernel reprograms it; delayed ISR catches up in tickless and periodic modes. |
 | Hardware | `k_cycle_get_64()` and `k_uptime_get()` are monotonic; measured uptime/sleep drift is bounded over a long interval; `k_sleep()` covers one and many ticks; tickless idle wakes at deadlines; periodic mode remains stable under interrupt load and around `TIME0` rollover. |
 
 ## Risks and boundaries
@@ -253,7 +308,8 @@ The implementation belongs in the Zephyr tree, not this repository:
 - Target transfer crosses clock domains and has documented approximately 200
   ns slip. Tests need tolerance; software must not busy-wait for exact equality.
 - The level comparator makes ordering correctness mandatory. Enabling before a
-  future target has committed can create an immediate interrupt storm.
+  future target has committed and survived the coherent post-clear recheck can
+  create an immediate interrupt storm.
 - Reprogramming `CLOCKS_PER_TICK` does not reset the current prescaler. The
   required reset after divider programming is what establishes the exact first
   1 MHz counter interval and the trustworthy zero epoch.
