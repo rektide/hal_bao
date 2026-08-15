@@ -4,7 +4,8 @@ The wave-0 research corpus behind the port. Written independently by four
 agents, synthesized in `04-synthesis.md`. The durable home for these is the
 shared doc repo (`~/a/doc/bao/`); this copy keeps the effort self-contained.
 
-Read `04-synthesis.md` first; the rest are its sources.
+Read `04-synthesis.md` first for the original port plan. Read
+`08-device-creation-reform.md` for the current provider/consumer architecture.
 
 - [`00-soc-inventory.md`](00-soc-inventory.md) — CPU (VexRiscv RV32IMAC+Zkn,
   Sv32), memory map, peripheral table with base addresses, custom interrupt
@@ -30,5 +31,9 @@ Read `04-synthesis.md` first; the rest are its sources.
 - [`07-ticktimer-sysclock.md`](07-ticktimer-sysclock.md) — RTL-proven ticktimer
   divider, coherent counter and target-commit semantics, direct IRQ mapping,
   and the implementation and validation contract for Zephyr system time.
+- [`08-device-creation-reform.md`](08-device-creation-reform.md) — incremental
+  standard-provider architecture for clocks, UDMA common control, IFRAM,
+  IOX pinctrl/GPIO, interrupts, and multi-instance UART, with handoff invariants
+  and a buildable migration sequence.
 
 Synced from `~/a/doc/bao/` 2026-08-14.
