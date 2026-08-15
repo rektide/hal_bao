@@ -142,9 +142,16 @@ dependencies = [
 name = "bao-image"
 version = "0.1.0"
 dependencies = [
+ "bao-boot1-protocol",
  "bao1x-api",
+ "bytemuck",
  "clap 4.6.6",
+ "ed25519-dalek",
  "goblin",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "xous-semver",
  "xous-tools",

@@ -41,6 +41,37 @@ cargo run -p bao-image -- sign \
 Developer-signed images irreversibly put a device into developer mode and erase
 on-chip secrets. Use a dedicated development board.
 
+Inspect the final signed UF2 before delivery:
+
+```sh
+cargo run -p bao-image -- inspect build/zephyr/zephyr.uf2
+cargo run -p bao-image -- inspect build/zephyr/zephyr.uf2 --json
+```
+
+Inspection reuses `bao-boot1-protocol`'s canonical UF2 parser. It reports the
+canonical baremetal profile, signed-header metadata, and classical signature
+verification against the keys embedded in the artifact. This does not predict
+device acceptance: installed keys, revocations, lifecycle state, anti-rollback,
+and PQ policy remain device-local.
+
+Copy to an explicitly selected boot1 MSC mount, or omit `--target` only when
+exactly one mounted volume labeled `BAOCHIP` exists:
+
+```sh
+cargo run -p bao-image -- copy build/zephyr/zephyr.uf2 \
+  --target /media/$USER/BAOCHIP --dry-run
+cargo run -p bao-image -- copy build/zephyr/zephyr.uf2 \
+  --target /media/$USER/BAOCHIP
+```
+
+The copy command completes preflight before target discovery or file creation,
+rejects `ALTCHIP` and ambiguous targets, never overwrites an existing file, and
+writes a no-clobber temporary file followed by file flush/sync, rename, and
+directory sync. On boot1's synthetic FAT volume the temporary write itself is
+visible to the UF2 sector handler; rename atomicity protects the host-visible
+filename, not device installation. Post-copy boot1 audit and boot validation are
+still required.
+
 Run the host-side tests with:
 
 ```sh

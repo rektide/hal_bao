@@ -45,6 +45,11 @@ impl Uf2Block {
     pub fn bytes(&self) -> &[u8; BLOCK_SIZE] {
         &self.bytes
     }
+
+    /// Return the validated UF2 payload.
+    pub fn payload(&self) -> &[u8] {
+        &self.bytes[32..32 + self.payload_size as usize]
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

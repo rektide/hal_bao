@@ -3,15 +3,25 @@
 use std::{
     error::Error,
     fmt, fs,
+    io::{self, Write},
     mem::size_of,
     path::{Path, PathBuf},
+    process::Command,
     str::FromStr,
 };
 
+use bao_boot1_protocol::{Uf2Image, preflight_bytes};
 use bao1x_api::{
-    BAREMETAL_START, JUMP_INSTRUCTION, KERNEL_START, StaticsInRom, signatures::SIGBLOCK_LEN,
+    BAREMETAL_START, JUMP_INSTRUCTION, KERNEL_START, StaticsInRom,
+    signatures::{
+        FunctionCode, MAGIC_NUMBER, SIGBLOCK_LEN, SIGNATURE_PQ_LENGTH, SignatureInFlash,
+        UNSIGNED_LEN,
+    },
 };
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use goblin::elf::{Elf, header::EM_RISCV, program_header::PT_LOAD};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256, Sha512};
 use xous_semver::SemVer;
 use xous_tools::sign_image::{Version, convert_to_uf2, load_pem, sign_file};
 
@@ -19,6 +29,7 @@ pub const BAREMETAL_CODE_ORIGIN: u64 =
     (BAREMETAL_START + SIGBLOCK_LEN + size_of::<StaticsInRom>()) as u64;
 pub const BAREMETAL_CODE_END: u64 = (BAREMETAL_START + 256 * 1024 - 1024) as u64;
 const PQ_SIGNATURE_SIZE: u64 = 3856;
+const HEADER_JUMP: u32 = 0x3000_006f;
 
 #[derive(Debug)]
 pub struct ImageError(String);
@@ -36,6 +47,405 @@ impl fmt::Display for ImageError {
 }
 
 impl Error for ImageError {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EmbeddedVerification {
+    Verified { key_slot: usize, key_tag: String },
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EmbeddedKey {
+    pub slot: usize,
+    pub tag: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct InspectionReport {
+    pub profile: &'static str,
+    pub blocks: usize,
+    pub image_bytes: usize,
+    pub signed_len: u32,
+    pub function: &'static str,
+    pub signature_mode: &'static str,
+    pub version: u32,
+    pub corrected_version: u32,
+    pub compatible_header: bool,
+    pub anti_rollback: u32,
+    pub minimum_version_hex: String,
+    pub image_version_hex: String,
+    pub pq_enabled: bool,
+    pub embedded_keys: Vec<EmbeddedKey>,
+    pub embedded_verification: EmbeddedVerification,
+    pub device_acceptance: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MountCandidate {
+    pub path: PathBuf,
+    pub label: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct CopyOptions<'a> {
+    pub image: &'a Path,
+    pub target: Option<&'a Path>,
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyReport {
+    pub target: PathBuf,
+    pub destination: PathBuf,
+    pub dry_run: bool,
+    pub bytes: usize,
+}
+
+fn tag_string(tag: &[u8; 4]) -> String {
+    String::from_utf8_lossy(tag).trim_end().to_owned()
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn inspect_image(image: &Uf2Image) -> Result<InspectionReport, Box<dyn Error>> {
+    let mut bytes = Vec::with_capacity(image.len() * 256);
+    for block in image.iter() {
+        bytes.extend_from_slice(block.payload());
+    }
+    if bytes.len() < SIGBLOCK_LEN {
+        return Err(
+            ImageError::new("signed image is shorter than the 768-byte signature block").into(),
+        );
+    }
+
+    let header =
+        bytemuck::pod_read_unaligned::<SignatureInFlash>(&bytes[..size_of::<SignatureInFlash>()]);
+    if header._jal_instruction != HEADER_JUMP {
+        return Err(ImageError::new(format!(
+            "signature-block trampoline is 0x{:08x}, expected 0x{HEADER_JUMP:08x}",
+            header._jal_instruction
+        ))
+        .into());
+    }
+    if header.sealed_data.magic != MAGIC_NUMBER {
+        return Err(ImageError::new("signed header has invalid Baochip magic").into());
+    }
+    if header.sealed_data.function_code != FunctionCode::Baremetal as u32 {
+        return Err(ImageError::new(format!(
+            "signed header function is {}, expected baremetal ({})",
+            header.sealed_data.function_code,
+            FunctionCode::Baremetal as u32
+        ))
+        .into());
+    }
+    if bytes[UNSIGNED_LEN + size_of::<bao1x_api::signatures::SealedFields>()..SIGBLOCK_LEN]
+        .iter()
+        .any(|byte| *byte != 0)
+    {
+        return Err(ImageError::new("signature block has non-zero reserved padding").into());
+    }
+    if word_at(&bytes, SIGBLOCK_LEN) != JUMP_INSTRUCTION {
+        return Err(ImageError::new("presign image has an invalid code trampoline").into());
+    }
+
+    let signed_end = UNSIGNED_LEN
+        .checked_add(header.sealed_data.signed_len as usize)
+        .ok_or_else(|| ImageError::new("signed length overflows"))?;
+    if signed_end < SIGBLOCK_LEN || signed_end > bytes.len() {
+        return Err(ImageError::new(format!(
+            "signed length ends at byte {signed_end}, outside the reconstructed image"
+        ))
+        .into());
+    }
+    let pq_size = if header.sealed_data.pq_enabled == 0 {
+        0
+    } else {
+        SIGNATURE_PQ_LENGTH
+    };
+    let image_bytes = signed_end
+        .checked_add(pq_size)
+        .ok_or_else(|| ImageError::new("signed image length overflows"))?;
+    if image_bytes > bytes.len() {
+        return Err(ImageError::new("PQ signature extends beyond the reconstructed image").into());
+    }
+    if bytes[image_bytes..].iter().any(|byte| *byte != 0) {
+        return Err(ImageError::new("UF2 contains non-zero data after the signed image").into());
+    }
+
+    let signed = &bytes[UNSIGNED_LEN..signed_end];
+    let signature = Signature::from_bytes(&header.signature);
+    let signed_hash = Sha512::digest(signed);
+    let embedded_keys = header
+        .sealed_data
+        .pubkeys
+        .iter()
+        .enumerate()
+        .filter(|(_, key)| key.pk != [0; 32])
+        .map(|(slot, key)| EmbeddedKey {
+            slot,
+            tag: tag_string(&key.tag),
+        })
+        .collect();
+    let verification = header
+        .sealed_data
+        .pubkeys
+        .iter()
+        .enumerate()
+        .find_map(|(slot, key)| {
+            if key.pk == [0; 32] {
+                return None;
+            }
+            let verifying_key = VerifyingKey::from_bytes(&key.pk).ok()?;
+            let valid = if header.aad_len == 0 {
+                let mut digest = Sha512::new();
+                digest.update(signed);
+                verifying_key
+                    .verify_prehashed(digest, None, &signature)
+                    .is_ok()
+            } else if header.aad_len as usize <= header.aad.len() {
+                let mut message = header.aad[..header.aad_len as usize].to_vec();
+                message.extend_from_slice(&Sha256::digest(signed_hash));
+                verifying_key.verify(&message, &signature).is_ok()
+            } else {
+                false
+            };
+            valid.then(|| EmbeddedVerification::Verified {
+                key_slot: slot,
+                key_tag: tag_string(&key.tag),
+            })
+        })
+        .unwrap_or(EmbeddedVerification::Failed);
+
+    Ok(InspectionReport {
+        profile: "canonical_baochip_baremetal_uf2",
+        blocks: image.len(),
+        image_bytes,
+        signed_len: header.sealed_data.signed_len,
+        function: "baremetal",
+        signature_mode: if header.aad_len == 0 {
+            "ed25519ph"
+        } else {
+            "fido2_ed25519"
+        },
+        version: header.sealed_data.version,
+        corrected_version: header.sealed_data.corrected_version,
+        compatible_header: header.is_compatible(),
+        anti_rollback: header.sealed_data.anti_rollback,
+        minimum_version_hex: hex(&header.sealed_data.min_semver),
+        image_version_hex: hex(&header.sealed_data.semver),
+        pq_enabled: header.sealed_data.pq_enabled != 0,
+        embedded_keys,
+        embedded_verification: verification,
+        device_acceptance: "unknown: depends on installed keys, revocations, lifecycle, anti-rollback, and PQ policy",
+    })
+}
+
+fn word_at(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes(
+        bytes[offset..offset + 4]
+            .try_into()
+            .expect("four-byte word"),
+    )
+}
+
+/// Inspect a canonical signed Baochip baremetal UF2 without predicting device acceptance.
+pub fn inspect_bytes(bytes: &[u8]) -> Result<InspectionReport, Box<dyn Error>> {
+    inspect_image(&preflight_bytes(bytes)?)
+}
+
+pub fn inspect_file(path: &Path) -> Result<InspectionReport, Box<dyn Error>> {
+    inspect_bytes(&fs::read(path)?)
+}
+
+#[derive(Deserialize)]
+struct Lsblk {
+    blockdevices: Vec<LsblkDevice>,
+}
+
+#[derive(Deserialize)]
+struct LsblkDevice {
+    label: Option<String>,
+    #[serde(default)]
+    mountpoints: Vec<Option<PathBuf>>,
+    #[serde(default)]
+    children: Vec<LsblkDevice>,
+}
+
+fn collect_mounts(device: LsblkDevice, mounts: &mut Vec<MountCandidate>) {
+    if let Some(label) = device.label
+        && (label == "BAOCHIP" || label == "ALTCHIP")
+    {
+        mounts.extend(
+            device
+                .mountpoints
+                .into_iter()
+                .flatten()
+                .map(|path| MountCandidate {
+                    path,
+                    label: label.clone(),
+                }),
+        );
+    }
+    for child in device.children {
+        collect_mounts(child, mounts);
+    }
+}
+
+/// Discover mounted Baochip boot volumes using block-device labels.
+pub fn discover_mounts() -> Result<Vec<MountCandidate>, Box<dyn Error>> {
+    let output = Command::new("lsblk")
+        .args(["--json", "--output", "LABEL,MOUNTPOINTS"])
+        .output()?;
+    if !output.status.success() {
+        return Err(ImageError::new(format!("lsblk failed with {}", output.status)).into());
+    }
+    let listing: Lsblk = serde_json::from_slice(&output.stdout)?;
+    let mut mounts = Vec::new();
+    for device in listing.blockdevices {
+        collect_mounts(device, &mut mounts);
+    }
+    Ok(mounts)
+}
+
+fn select_mount(
+    candidates: &[MountCandidate],
+    requested: Option<&Path>,
+) -> Result<PathBuf, Box<dyn Error>> {
+    let selected = if let Some(requested) = requested {
+        let requested = requested.canonicalize()?;
+        candidates
+            .iter()
+            .find(|candidate| {
+                candidate
+                    .path
+                    .canonicalize()
+                    .is_ok_and(|path| path == requested)
+            })
+            .ok_or_else(|| {
+                ImageError::new("explicit target is not a mounted BAOCHIP/ALTCHIP volume")
+            })?
+            .clone()
+    } else {
+        let safe: Vec<_> = candidates
+            .iter()
+            .filter(|candidate| candidate.label == "BAOCHIP")
+            .collect();
+        match safe.as_slice() {
+            [candidate] => (*candidate).clone(),
+            [] => return Err(ImageError::new("no mounted BAOCHIP volume found").into()),
+            _ => {
+                return Err(ImageError::new("multiple BAOCHIP volumes found; use --target").into());
+            }
+        }
+    };
+    if selected.label != "BAOCHIP" {
+        return Err(ImageError::new("refusing ALTCHIP target").into());
+    }
+    Ok(selected.path.canonicalize()?)
+}
+
+trait CopyOps {
+    fn write_temp(&mut self, path: &Path, bytes: &[u8]) -> io::Result<()>;
+    fn rename(&mut self, source: &Path, destination: &Path) -> io::Result<()>;
+    fn sync_directory(&mut self, path: &Path) -> io::Result<()>;
+}
+
+struct FsCopyOps;
+
+impl CopyOps for FsCopyOps {
+    fn write_temp(&mut self, path: &Path, bytes: &[u8]) -> io::Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        file.write_all(bytes)?;
+        file.flush()?;
+        file.sync_all()
+    }
+
+    fn rename(&mut self, source: &Path, destination: &Path) -> io::Result<()> {
+        Ok(rustix::fs::renameat_with(
+            rustix::fs::CWD,
+            source,
+            rustix::fs::CWD,
+            destination,
+            rustix::fs::RenameFlags::NOREPLACE,
+        )?)
+    }
+
+    fn sync_directory(&mut self, path: &Path) -> io::Result<()> {
+        fs::File::open(path)?.sync_all()
+    }
+}
+
+fn copy_with_ops(
+    image_path: &Path,
+    bytes: &[u8],
+    candidates: &[MountCandidate],
+    requested: Option<&Path>,
+    dry_run: bool,
+    ops: &mut impl CopyOps,
+) -> Result<CopyReport, Box<dyn Error>> {
+    let target = select_mount(candidates, requested)?;
+    let filename = image_path
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| ImageError::new("image path has no filename"))?;
+    let destination = target.join(filename);
+    if destination.exists() {
+        return Err(
+            ImageError::new(format!("refusing to overwrite {}", destination.display())).into(),
+        );
+    }
+    if !dry_run {
+        let temporary = target.join(format!(".{}.bao-image.tmp", filename.to_string_lossy()));
+        if temporary.exists() {
+            return Err(ImageError::new(format!(
+                "temporary file already exists: {}",
+                temporary.display()
+            ))
+            .into());
+        }
+        ops.write_temp(&temporary, bytes)?;
+        if let Err(error) = ops.rename(&temporary, &destination) {
+            let _ = fs::remove_file(&temporary);
+            return Err(error.into());
+        }
+        ops.sync_directory(&target)?;
+    }
+    Ok(CopyReport {
+        target,
+        destination,
+        dry_run,
+        bytes: bytes.len(),
+    })
+}
+
+/// Preflight and optionally copy an image to a positively identified BAOCHIP mount.
+pub fn copy_image(options: CopyOptions<'_>) -> Result<CopyReport, Box<dyn Error>> {
+    let bytes = fs::read(options.image)?;
+    let inspection = inspect_bytes(&bytes)?;
+    if !inspection.compatible_header {
+        return Err(ImageError::new("refusing to copy: signed header is not compatible").into());
+    }
+    if inspection.embedded_verification == EmbeddedVerification::Failed {
+        return Err(
+            ImageError::new("refusing to copy: no embedded key verifies the signature").into(),
+        );
+    }
+    let candidates = discover_mounts()?;
+    copy_with_ops(
+        options.image,
+        &bytes,
+        &candidates,
+        options.target,
+        options.dry_run,
+        &mut FsCopyOps,
+    )
+}
 
 #[derive(Debug)]
 struct LoadSegment {
@@ -234,7 +644,8 @@ pub fn sign_image(options: SignOptions<'_>) -> Result<PathBuf, Box<dyn Error>> {
 mod tests {
     use std::io::Write;
 
-    use tempfile::NamedTempFile;
+    use ed25519_dalek::{DigestSigner, SigningKey};
+    use tempfile::{NamedTempFile, TempDir};
 
     use super::*;
 
@@ -279,6 +690,161 @@ mod tests {
         let output = NamedTempFile::new()?;
         pack_elf(input.path(), output.path())?;
         Ok(fs::read(output.path())?)
+    }
+
+    fn signed_uf2() -> Vec<u8> {
+        let signing_key = SigningKey::from_bytes(&[7; 32]);
+        let mut header = SignatureInFlash {
+            _jal_instruction: HEADER_JUMP,
+            ..SignatureInFlash::default()
+        };
+        header.sealed_data.function_code = FunctionCode::Baremetal as u32;
+        header.sealed_data.anti_rollback = 1;
+        header.sealed_data.pubkeys[3].pk = signing_key.verifying_key().to_bytes();
+        header.sealed_data.pubkeys[3].tag = *b"dev ";
+
+        let mut protected = header.sealed_data.as_ref().to_vec();
+        protected.resize(SIGBLOCK_LEN - UNSIGNED_LEN, 0);
+        protected.extend_from_slice(&JUMP_INSTRUCTION.to_le_bytes());
+        protected.extend_from_slice(b"test payload");
+        header.sealed_data.signed_len = protected.len() as u32;
+        protected[..size_of::<bao1x_api::signatures::SealedFields>()]
+            .copy_from_slice(header.sealed_data.as_ref());
+        let signature: Signature = signing_key.sign_digest(Sha512::new().chain_update(&protected));
+        header.signature.copy_from_slice(&signature.to_bytes());
+
+        let mut image = header.as_ref()[..UNSIGNED_LEN].to_vec();
+        image.extend_from_slice(&protected);
+        let blocks = image.len().div_ceil(256) as u32;
+        let mut uf2 = Vec::with_capacity(blocks as usize * 512);
+        for number in 0..blocks {
+            let mut block = [0; 512];
+            block[0..4].copy_from_slice(&0x0a32_4655_u32.to_le_bytes());
+            block[4..8].copy_from_slice(&0x9e5d_5157_u32.to_le_bytes());
+            block[8..12].copy_from_slice(&0x2000_u32.to_le_bytes());
+            block[12..16].copy_from_slice(
+                &(bao_boot1_protocol::BAREMETAL_START + number * 256).to_le_bytes(),
+            );
+            block[16..20].copy_from_slice(&256_u32.to_le_bytes());
+            block[20..24].copy_from_slice(&number.to_le_bytes());
+            block[24..28].copy_from_slice(&blocks.to_le_bytes());
+            block[28..32].copy_from_slice(&bao_boot1_protocol::BAOCHIP_FAMILY_ID.to_le_bytes());
+            let start = number as usize * 256;
+            let end = (start + 256).min(image.len());
+            block[32..32 + end - start].copy_from_slice(&image[start..end]);
+            block[508..512].copy_from_slice(&0x0ab1_6f30_u32.to_le_bytes());
+            uf2.extend_from_slice(&block);
+        }
+        uf2
+    }
+
+    #[derive(Default)]
+    struct RecordingOps {
+        events: Vec<&'static str>,
+    }
+
+    impl CopyOps for RecordingOps {
+        fn write_temp(&mut self, path: &Path, bytes: &[u8]) -> io::Result<()> {
+            self.events.push("write_sync");
+            FsCopyOps.write_temp(path, bytes)
+        }
+
+        fn rename(&mut self, source: &Path, destination: &Path) -> io::Result<()> {
+            self.events.push("rename");
+            FsCopyOps.rename(source, destination)
+        }
+
+        fn sync_directory(&mut self, path: &Path) -> io::Result<()> {
+            self.events.push("sync_directory");
+            FsCopyOps.sync_directory(path)
+        }
+    }
+
+    fn candidate(directory: &TempDir, label: &str) -> MountCandidate {
+        MountCandidate {
+            path: directory.path().to_path_buf(),
+            label: label.to_owned(),
+        }
+    }
+
+    #[test]
+    fn inspects_canonical_signed_uf2() {
+        let report = inspect_bytes(&signed_uf2()).unwrap();
+        assert_eq!(report.profile, "canonical_baochip_baremetal_uf2");
+        assert_eq!(
+            report.embedded_verification,
+            EmbeddedVerification::Verified {
+                key_slot: 3,
+                key_tag: "dev".to_owned()
+            }
+        );
+        assert!(report.device_acceptance.starts_with("unknown"));
+    }
+
+    #[test]
+    fn rejects_malformed_uf2_before_signed_header_parsing() {
+        let mut uf2 = signed_uf2();
+        uf2[0] ^= 1;
+        assert!(
+            inspect_bytes(&uf2)
+                .unwrap_err()
+                .to_string()
+                .contains("magic")
+        );
+    }
+
+    #[test]
+    fn refuses_altchip_even_when_explicit() {
+        let mount = TempDir::new().unwrap();
+        let error = select_mount(&[candidate(&mount, "ALTCHIP")], Some(mount.path())).unwrap_err();
+        assert!(error.to_string().contains("ALTCHIP"));
+    }
+
+    #[test]
+    fn refuses_ambiguous_baochip_mounts() {
+        let first = TempDir::new().unwrap();
+        let second = TempDir::new().unwrap();
+        let error = select_mount(
+            &[candidate(&first, "BAOCHIP"), candidate(&second, "BAOCHIP")],
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("multiple BAOCHIP"));
+    }
+
+    #[test]
+    fn dry_run_does_not_open_target_files() {
+        let mount = TempDir::new().unwrap();
+        let mut ops = RecordingOps::default();
+        let report = copy_with_ops(
+            Path::new("firmware.uf2"),
+            b"validated",
+            &[candidate(&mount, "BAOCHIP")],
+            None,
+            true,
+            &mut ops,
+        )
+        .unwrap();
+        assert!(report.dry_run);
+        assert!(ops.events.is_empty());
+        assert!(!report.destination.exists());
+    }
+
+    #[test]
+    fn copy_writes_then_renames_then_syncs_directory() {
+        let mount = TempDir::new().unwrap();
+        let mut ops = RecordingOps::default();
+        let report = copy_with_ops(
+            Path::new("firmware.uf2"),
+            b"validated",
+            &[candidate(&mount, "BAOCHIP")],
+            None,
+            false,
+            &mut ops,
+        )
+        .unwrap();
+        assert_eq!(ops.events, ["write_sync", "rename", "sync_directory"]);
+        assert_eq!(fs::read(report.destination).unwrap(), b"validated");
     }
 
     #[test]

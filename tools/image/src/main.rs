@@ -2,7 +2,9 @@
 
 use std::{error::Error, path::PathBuf};
 
-use bao_image::{SignOptions, pack_elf, sign_image};
+use bao_image::{
+    CopyOptions, EmbeddedVerification, SignOptions, copy_image, inspect_file, pack_elf, sign_image,
+};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -31,6 +33,22 @@ enum Command {
         #[arg(long, requires = "pq_key")]
         pq_key_cache: Option<PathBuf>,
     },
+    /// Inspect a canonical signed Baochip baremetal UF2.
+    Inspect {
+        input: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Preflight and copy a signed UF2 to a BAOCHIP MSC mount.
+    Copy {
+        input: PathBuf,
+        /// Mounted BAOCHIP volume. Required unless exactly one is discovered.
+        #[arg(long)]
+        target: Option<PathBuf>,
+        /// Validate and select the target without writing.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -58,6 +76,59 @@ fn main() -> Result<(), Box<dyn Error>> {
                 pq_key_cache: pq_key_cache.as_deref(),
             })?;
             println!("signed {} and wrote {}", output.display(), uf2.display());
+        }
+        Command::Inspect { input, json } => {
+            let report = inspect_file(&input)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("profile: {}", report.profile);
+                println!("blocks: {}", report.blocks);
+                println!("signed image bytes: {}", report.image_bytes);
+                println!("function: {}", report.function);
+                println!("signature mode: {}", report.signature_mode);
+                println!("signed length: {}", report.signed_len);
+                println!("header version: 0x{:08x}", report.version);
+                println!("corrected version: 0x{:08x}", report.corrected_version);
+                println!("header compatible: {}", report.compatible_header);
+                println!("anti-rollback: {}", report.anti_rollback);
+                println!("minimum version: {}", report.minimum_version_hex);
+                println!("image version: {}", report.image_version_hex);
+                println!("PQ signature present: {}", report.pq_enabled);
+                match report.embedded_verification {
+                    EmbeddedVerification::Verified { key_slot, key_tag } => {
+                        println!(
+                            "embedded-key verification: passed (slot {key_slot}, tag {key_tag:?})"
+                        );
+                    }
+                    EmbeddedVerification::Failed => println!("embedded-key verification: failed"),
+                }
+                println!("device acceptance: {}", report.device_acceptance);
+            }
+        }
+        Command::Copy {
+            input,
+            target,
+            dry_run,
+        } => {
+            let report = copy_image(CopyOptions {
+                image: &input,
+                target: target.as_deref(),
+                dry_run,
+            })?;
+            if report.dry_run {
+                println!(
+                    "dry run: validated {} bytes for {}",
+                    report.bytes,
+                    report.destination.display()
+                );
+            } else {
+                println!(
+                    "copied and synced {} bytes to {}",
+                    report.bytes,
+                    report.destination.display()
+                );
+            }
         }
     }
     Ok(())
