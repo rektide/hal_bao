@@ -292,6 +292,10 @@ pattern against `uf2`.
   config writes 1 — `signing/anti-rollback.hjson`); don't casually raise it, RRAM OWC wear is limited
   (`anti-rollback.hjson` header comment).
 
+## Cross-references
+
+- [05-lifecycle-delivery-validation](05-lifecycle-delivery-validation.md) — follow-up corrections and detailed audit/counter/runner policy
+
 ## Sources
 
 - `~/archive/betrusted-io/xous-core/README-baochip.md`

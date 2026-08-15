@@ -144,6 +144,7 @@ upstreaming) builds on that foundation.
 
 - [`../research/README.md`](../research/README.md) — the wave-0 research corpus
 - [`../research/04-synthesis.md`](../research/04-synthesis.md) — decisions table, risk register, open questions
+- [`../research/05-lifecycle-delivery-validation.md`](../research/05-lifecycle-delivery-validation.md) — boot1 audit, developer mode, counters, transport modes, and validation policy
 - [`../research/00-soc-inventory.md`](../research/00-soc-inventory.md) — memory map, IRQ table, peripheral details
 - [`../research/01-boot-delivery.md`](../research/01-boot-delivery.md) — signature block, JAL chain, UF2, sim
 - [`../research/02-zephyr-integration.md`](../research/02-zephyr-integration.md) — SoC/board file skeletons, module analysis

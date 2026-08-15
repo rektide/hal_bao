@@ -113,3 +113,4 @@ for non-Xous images — Zephyr's home.
 - Signature block layout, JAL chain, UF2 constants, handoff state, sim invocation: [01-boot-delivery](01-boot-delivery.md)
 - SoC/board file skeletons, hal_* module analysis, runner/toolchain mechanics: [02-zephyr-integration](02-zephyr-integration.md)
 - Rust support boundaries + utralib/svd2utra reuse assessment: [03-rust-survey](03-rust-survey.md)
+- Device audit, one-way counters, delivery modes, and runner scope: [05-lifecycle-delivery-validation](05-lifecycle-delivery-validation.md)

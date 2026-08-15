@@ -20,5 +20,8 @@ Read `04-synthesis.md` first; the rest are its sources.
   reuse.
 - [`04-synthesis.md`](04-synthesis.md) — decision table, phased bring-up plan
   (M0–M5), risk register, open questions.
+- [`05-lifecycle-delivery-validation.md`](05-lifecycle-delivery-validation.md)
+  — device audit preflight, developer mode and one-way counters, boot1 transport
+  modes, observable Dabao outputs, and runner scope.
 
 Synced from `~/a/doc/bao/` 2026-08-14.
