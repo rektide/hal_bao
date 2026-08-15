@@ -94,7 +94,7 @@ for non-Xous images — Zephyr's home.
 |----|------|----------|------------|
 | R1 | `.data` packer gap (xous-copy-object strips it) | High | Write custom packer in M1; verify with `readelf` + sim |
 | R2 | ROM budget: baremetal slot ≈ 254 KiB before Xous kernel @`0x6009FD00` | Medium | Watch size; if tight, negotiate slot layout w/ boot1 config or trim features; RRAM XIP so `.data`-in-ROM costs real space |
-| R3 | irqarray edge-vs-level ack semantics undocumented | Medium | Mirror Xous kernel ack sequence exactly; test each bank in sim |
+| R3 | irqarray edge-vs-level ack semantics | Resolved | RTL proves trigger-over-W1C priority: pre-ack edge events, post-ack level events after source quiescence; see 06 |
 | R4 | No JTAG on production parts | Medium | Physical UDMA UART2 at 1 Mbaud plus Verilator DUART output are the debug story; early-print + sim-first workflow |
 | R5 | Dev-signed image trips DEVELOPER_MODE irreversibly | Low (dev boards) | Use dedicated dev units; note in board docs |
 | R6 | UF2 family id must exactly match boot1 checks (`0xa7d76373`) | Low | Encode in SoC Kconfig.defconfig; smoke test |
@@ -114,3 +114,4 @@ for non-Xous images — Zephyr's home.
 - SoC/board file skeletons, hal_* module analysis, runner/toolchain mechanics: [02-zephyr-integration](02-zephyr-integration.md)
 - Rust support boundaries + utralib/svd2utra reuse assessment: [03-rust-survey](03-rust-survey.md)
 - Device audit, one-way counters, delivery modes, and runner scope: [05-lifecycle-delivery-validation](05-lifecycle-delivery-validation.md)
+- IRQ mask polarity, pending latch races, acknowledgment order, and driver algorithm: [06-irq-ack-semantics](06-irq-ack-semantics.md)

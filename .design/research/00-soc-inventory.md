@@ -341,6 +341,12 @@ re-enabled on return (kernel/src/arch/riscv/irq.rs:151-154).
 only matters before firmware sets it. Zephyr will set `mtvec` to its own single trap vector and
 poll SIM/SIP (M-mode) or run the same trick in S-mode.
 
+The exact trigger/clear priority, edge-versus-level acknowledgment order, and
+lost-event constraints are resolved in
+[`06-irq-ack-semantics.md`](06-irq-ack-semantics.md). In particular, MIP/SIP is
+a read-only masked view rather than an acknowledgment register; W1C occurs at
+the owning irqarray or peripheral event manager.
+
 ---
 
 ## 5. Clock / power
