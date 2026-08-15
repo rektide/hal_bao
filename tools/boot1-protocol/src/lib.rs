@@ -250,8 +250,8 @@ pub enum Protocol {
 
 /// Successful protocol handling reported by boot1.
 ///
-/// Some boot1 versions print `Write error` and then still print `Wrote`. Consequently, an
-/// acknowledged transfer confirms command handling, but does not prove that RRAM persisted it.
+/// Reported boot1 write errors fail the transfer even if followed by `Wrote`. An acknowledged
+/// transfer confirms command handling, but cannot independently prove that RRAM persisted it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransferReport {
     pub protocol: Protocol,
@@ -263,6 +263,13 @@ pub struct TransferReport {
 pub enum AckFailure {
     Mismatch,
     Timeout,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AckResponse {
+    Accepted,
+    Mismatch,
+    DeviceWrite(String),
 }
 
 impl std::fmt::Display for AckFailure {
@@ -296,6 +303,8 @@ pub enum SendError {
         #[source]
         source: io::Error,
     },
+    #[error("block {block} device write failed: {report}")]
+    DeviceWrite { block: usize, report: String },
     #[error("block {block} failed after {attempts} attempts: {reason}")]
     BlockFailed {
         block: usize,
@@ -311,11 +320,11 @@ fn write_command(transport: &mut impl ReplTransport, command: &str) -> io::Resul
     transport.flush()
 }
 
-fn read_until(
+fn read_until<T>(
     transport: &mut impl ReplTransport,
     timeout: Duration,
-    mut inspect: impl FnMut(&str) -> Option<bool>,
-) -> io::Result<Option<bool>> {
+    mut inspect: impl FnMut(&str) -> Option<T>,
+) -> io::Result<Option<T>> {
     let deadline = Instant::now() + timeout;
     let mut pending = Vec::new();
     let mut buffer = [0_u8; 256];
@@ -404,8 +413,8 @@ fn set_echo(transport: &mut impl ReplTransport, enabled: bool) -> io::Result<()>
 
 /// Transfer a preflighted image and require an exact acknowledgment for every block.
 ///
-/// An acknowledgment does not prove persistence: affected boot1 versions can print `Write error`
-/// and then `Wrote` after a failed RRAM write. Verify the resulting image independently.
+/// A reported `Write error` fails the transfer even if boot1 subsequently prints `Wrote`. An
+/// acknowledgment still cannot independently prove persistence; verify the image as appropriate.
 pub fn send_image(
     transport: &mut impl ReplTransport,
     image: &Uf2Image,
@@ -440,25 +449,38 @@ pub fn send_image(
                         source,
                     })?;
                 let response = read_until(transport, options.response_timeout, |line| {
-                    if line.starts_with("CRC error ") {
-                        Some(false)
+                    if line.starts_with("Write error") {
+                        Some(AckResponse::DeviceWrite(line.to_owned()))
+                    } else if line.starts_with("CRC error ") {
+                        Some(AckResponse::Mismatch)
                     } else {
-                        parse_ack(line, block, protocol, crc)
+                        parse_ack(line, block, protocol, crc).map(|accepted| {
+                            if accepted {
+                                AckResponse::Accepted
+                            } else {
+                                AckResponse::Mismatch
+                            }
+                        })
                     }
                 })
                 .map_err(|source| SendError::BlockRead {
                     block: index,
                     source,
                 })?;
-                if response == Some(true) {
-                    retry_count += attempt - 1;
-                    progress(index + 1, image.len());
-                    break;
-                }
-                let reason = if response == Some(false) {
-                    AckFailure::Mismatch
-                } else {
-                    AckFailure::Timeout
+                let reason = match response {
+                    Some(AckResponse::Accepted) => {
+                        retry_count += attempt - 1;
+                        progress(index + 1, image.len());
+                        break;
+                    }
+                    Some(AckResponse::DeviceWrite(report)) => {
+                        return Err(SendError::DeviceWrite {
+                            block: index,
+                            report,
+                        });
+                    }
+                    Some(AckResponse::Mismatch) => AckFailure::Mismatch,
+                    None => AckFailure::Timeout,
                 };
                 if attempt < options.retries {
                     thread::sleep(options.retry_delay);
@@ -514,6 +536,7 @@ mod tests {
     struct MockBoot1 {
         crc: bool,
         fail_first_block: bool,
+        device_write_error: bool,
         block_attempts: usize,
         reads: VecDeque<u8>,
         writes: Vec<u8>,
@@ -530,7 +553,17 @@ mod tests {
                 }
             } else if command.starts_with("uf2 ") {
                 self.block_attempts += 1;
-                if self.fail_first_block && self.block_attempts == 1 {
+                if self.device_write_error {
+                    let parts: Vec<_> = command.split_whitespace().collect();
+                    if self.crc {
+                        format!(
+                            "Write error\r\nWrote 256 to 0x60060000 crc {}\r\n",
+                            parts[2]
+                        )
+                    } else {
+                        "Write error\r\nWrote 256 to 0x60060000\r\n".to_owned()
+                    }
+                } else if self.fail_first_block && self.block_attempts == 1 {
                     "Wrote 255 to 0x60060000\r\n".to_owned()
                 } else {
                     let parts: Vec<_> = command.split_whitespace().collect();
@@ -670,5 +703,34 @@ mod tests {
         };
         assert!(send_image(&mut mock, &image(), &options, |_, _| {}).is_err());
         assert!(mock.writes.ends_with(b"localecho on\r"));
+    }
+
+    fn assert_device_write_error(crc: bool) {
+        let mut mock = MockBoot1 {
+            crc,
+            device_write_error: true,
+            ..Default::default()
+        };
+        let error = send_image(&mut mock, &image(), &test_options(), |_, _| {}).unwrap_err();
+
+        assert!(matches!(
+            error,
+            SendError::DeviceWrite {
+                block: 0,
+                ref report
+            } if report == "Write error"
+        ));
+        assert_eq!(mock.block_attempts, 1);
+        assert!(mock.writes.ends_with(b"localecho on\r"));
+    }
+
+    #[test]
+    fn legacy_write_error_precedes_and_overrides_valid_ack() {
+        assert_device_write_error(false);
+    }
+
+    #[test]
+    fn crc_write_error_precedes_and_overrides_valid_ack() {
+        assert_device_write_error(true);
     }
 }

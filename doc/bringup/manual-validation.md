@@ -49,10 +49,11 @@ do not remain available after boot1 hands control to Zephyr.
 
 The `bao-uf2send` tool sends the same UF2 over the boot1 REPL with per-block
 acknowledgments and retries. Its reusable `bao-boot1-protocol` crate validates
-the complete canonical image before transfer. A boot1 `Wrote` acknowledgment
-confirms protocol handling, not persistence: after a failed RRAM write, boot1
-can print `Write error` and then still print `Wrote`. Independently verify the
-installed image before treating the update as durable.
+the complete canonical image before transfer. It treats a reported boot1
+`Write error` as a transfer failure even if followed by `Wrote`. A `Wrote`
+acknowledgment confirms protocol handling, not persistence; power loss and
+silent corruption remain possible. Independently verify the installed image
+before treating the update as durable.
 
 The package boundary is intentional: `bao-boot1-protocol` is the reusable,
 transport-independent validation and REPL protocol library;
@@ -214,9 +215,10 @@ acknowledgments when available, and otherwise uses legacy acknowledgments. It
 requires an exact acknowledgment and makes at most three attempts per block by
 default; `--timeout-ms`, `--settle-ms`, and `--retries` adjust those bounds.
 This does not replace the earlier `audit`: host validation cannot establish
-device key, anti-rollback, or PQ policy. It also cannot detect persistence when
-affected boot1 versions print `Write error` and then `Wrote`, so independently
-verify installation before treating serial transfer as durable.
+device key, anti-rollback, or PQ policy. It fails when boot1 reports `Write
+error`, including when a misleading `Wrote` line follows, but an acknowledgment
+cannot independently prove persistence against power loss or silent corruption.
+Verify installation before treating serial transfer as durable.
 
 1. Confirm that exactly one FAT volume has label `BAOCHIP`.
 2. Confirm that the selected mount is not labeled `ALTCHIP`.

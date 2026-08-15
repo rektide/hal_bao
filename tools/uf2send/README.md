@@ -42,10 +42,11 @@ response selects CRC commands and exact size/address/CRC acknowledgments;
 acknowledgments. CRC errors, mismatches, and timeouts are retried only up to the
 configured attempt limit. Local echo is restored on success or failure.
 
-An accepted `Wrote` acknowledgment confirms that boot1 handled the command,
-but it does not prove persistence: affected boot1 versions can print `Write
-error` after a failed RRAM write and then still print `Wrote`. The sender cannot
-disambiguate that sequence, so verify the installed image independently.
+The sender detects a reported `Write error` while awaiting an acknowledgment
+and fails the transfer immediately, even when affected boot1 versions print a
+syntactically valid `Wrote` line afterward. An accepted `Wrote` acknowledgment
+still cannot independently prove persistence: power loss and silent corruption
+remain possible, so verify the installed image independently.
 
 Hold PROG to remain in boot1. A developer-signed image can irreversibly enter
 developer mode and erase device secrets; inspect the device with `audit`

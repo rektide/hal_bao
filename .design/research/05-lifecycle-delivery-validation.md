@@ -178,9 +178,10 @@ The current sender preflights the entire image before opening a port, probes
 `has-crc`, requires exact size/address acknowledgments (and CRC when supported),
 and bounds attempts per block. These host guarantees do not supersede boot1
 `audit`, which remains necessary for device-local key, anti-rollback, and PQ
-policy. They also do not prove RRAM persistence: affected boot1 versions can
-print `Write error` and then `Wrote`, so an acknowledged transfer still needs
-independent installation verification.
+policy. The sender now fails on a reported `Write error` even when affected
+boot1 versions subsequently print `Wrote`. Acknowledgments still do not
+independently prove RRAM persistence against power loss or silent corruption,
+so installation needs independent verification.
 
 ## Cross-references
 
