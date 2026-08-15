@@ -248,10 +248,11 @@ pub enum Protocol {
     Crc,
 }
 
-/// Successful protocol handling reported by boot1.
+/// Successful command parsing reported by boot1.
 ///
-/// Reported boot1 write errors fail the transfer even if followed by `Wrote`. An acknowledged
-/// transfer confirms command handling, but cannot independently prove that RRAM persisted it.
+/// A `Wrote` acknowledgment does not report RRAM persistence. In particular, current stock boot1
+/// can acknowledge a failed RRAM write because its write error is sent only to DUART. Perform a
+/// post-write audit and boot validation before treating the image as installed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransferReport {
     pub protocol: Protocol,
@@ -303,6 +304,10 @@ pub enum SendError {
         #[source]
         source: io::Error,
     },
+    /// A boot1 variant reported an in-band device write error.
+    ///
+    /// Current stock boot1 does not expose its RRAM write error on the REPL transport, so this
+    /// error cannot detect stock boot1 persistence failures.
     #[error("block {block} device write failed: {report}")]
     DeviceWrite { block: usize, report: String },
     #[error("block {block} failed after {attempts} attempts: {reason}")]
@@ -411,10 +416,12 @@ fn set_echo(transport: &mut impl ReplTransport, enabled: bool) -> io::Result<()>
     Ok(())
 }
 
-/// Transfer a preflighted image and require an exact acknowledgment for every block.
+/// Transfer a preflighted image and require an exact command acknowledgment for every block.
 ///
-/// A reported `Write error` fails the transfer even if boot1 subsequently prints `Wrote`. An
-/// acknowledgment still cannot independently prove persistence; verify the image as appropriate.
+/// An in-band `Write error` from a boot1 variant fails the transfer even if followed by `Wrote`.
+/// Current stock boot1 sends RRAM write errors only to DUART and unconditionally sends `Wrote` on
+/// the REPL, so success confirms command parsing only. Perform a post-write audit and boot
+/// validation before treating the image as installed.
 pub fn send_image(
     transport: &mut impl ReplTransport,
     image: &Uf2Image,
@@ -536,7 +543,8 @@ mod tests {
     struct MockBoot1 {
         crc: bool,
         fail_first_block: bool,
-        device_write_error: bool,
+        in_band_write_error: bool,
+        duart_only_write_error: bool,
         block_attempts: usize,
         reads: VecDeque<u8>,
         writes: Vec<u8>,
@@ -553,7 +561,7 @@ mod tests {
                 }
             } else if command.starts_with("uf2 ") {
                 self.block_attempts += 1;
-                if self.device_write_error {
+                if self.in_band_write_error {
                     let parts: Vec<_> = command.split_whitespace().collect();
                     if self.crc {
                         format!(
@@ -566,6 +574,9 @@ mod tests {
                 } else if self.fail_first_block && self.block_attempts == 1 {
                     "Wrote 255 to 0x60060000\r\n".to_owned()
                 } else {
+                    // Stock boot1's DUART-only write error is absent from the REPL response, so
+                    // duart_only_write_error intentionally has the same in-band result as success.
+                    let _ = self.duart_only_write_error;
                     let parts: Vec<_> = command.split_whitespace().collect();
                     if self.crc {
                         format!("Wrote 256 to 0x60060000 crc {}\r\n", parts[2])
@@ -705,10 +716,26 @@ mod tests {
         assert!(mock.writes.ends_with(b"localecho on\r"));
     }
 
-    fn assert_device_write_error(crc: bool) {
+    #[test]
+    fn stock_duart_only_write_error_is_indistinguishable_from_ack() {
+        let mut mock = MockBoot1 {
+            crc: true,
+            duart_only_write_error: true,
+            ..Default::default()
+        };
+
+        let report = send_image(&mut mock, &image(), &test_options(), |_, _| {}).unwrap();
+
+        assert_eq!(report.blocks, 1);
+        assert_eq!(mock.block_attempts, 1);
+    }
+
+    // Some boot1 variants may expose write failures on the REPL even though current stock boot1
+    // emits them only on DUART. Preserve fail-fast handling for that stronger protocol.
+    fn assert_in_band_device_write_error(crc: bool) {
         let mut mock = MockBoot1 {
             crc,
-            device_write_error: true,
+            in_band_write_error: true,
             ..Default::default()
         };
         let error = send_image(&mut mock, &image(), &test_options(), |_, _| {}).unwrap_err();
@@ -725,12 +752,12 @@ mod tests {
     }
 
     #[test]
-    fn legacy_write_error_precedes_and_overrides_valid_ack() {
-        assert_device_write_error(false);
+    fn legacy_in_band_write_error_precedes_valid_ack() {
+        assert_in_band_device_write_error(false);
     }
 
     #[test]
-    fn crc_write_error_precedes_and_overrides_valid_ack() {
-        assert_device_write_error(true);
+    fn crc_in_band_write_error_precedes_valid_ack() {
+        assert_in_band_device_write_error(true);
     }
 }
