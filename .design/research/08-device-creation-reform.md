@@ -453,6 +453,7 @@ legacy path in the same domain's buildable sequence.
 
 ## Cross-references
 
+- [`/.design/research/09-ticktimer-config-adjudication.md`](/.design/research/09-ticktimer-config-adjudication.md) - resolves the later configurable-rate implementation against this document's CDC/ownership constraints and replaces the fixed-1-MHz limitation with explicit conservative bounds.
 - [`/.design/research/06-irq-ack-semantics.md`](/.design/research/06-irq-ack-semantics.md) - defines edge-versus-level acknowledgment order, direct-line bypass, trigger priority, and the controller tests that interrupt flags must drive.
 - [`/.design/research/07-ticktimer-sysclock.md`](/.design/research/07-ticktimer-sysclock.md) - supplies the divider/reset takeover, bounded coherent reads, alarm margin, direct IRQ, and existing tickless/periodic evidence narrowed here to a fixed-rate clock envelope.
 - [`/.design/research/05-lifecycle-delivery-validation.md`](/.design/research/05-lifecycle-delivery-validation.md) - establishes boot1 transport ownership, physical UART2 observability, lifecycle constraints, and why a successful handoff must be observed rather than inferred.

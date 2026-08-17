@@ -384,6 +384,7 @@ algorithms for those synthetic cases, not their physical incidence.
 
 ## Cross-references
 
+- [`/.design/research/09-ticktimer-config-adjudication.md`](/.design/research/09-ticktimer-config-adjudication.md) - supersedes the fixed-1-MHz support boundary, preserves this document's two-reset ownership proof, and defines the accepted conservative configurable-rate envelope.
 - [`/.design/research/00-soc-inventory.md`](/.design/research/00-soc-inventory.md) - SoC clock tree, ticktimer placement, and direct CPU line inventory.
 - [`/.design/research/04-synthesis.md`](/.design/research/04-synthesis.md) - milestone decision selecting ticktimer as the M2 system clock.
 - [`/.design/research/06-irq-ack-semantics.md`](/.design/research/06-irq-ack-semantics.md) - flattened interrupt model and the distinction between direct lines and irqarray children.

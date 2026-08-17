@@ -5,7 +5,9 @@ agents, synthesized in `04-synthesis.md`. The durable home for these is the
 shared doc repo (`~/a/doc/bao/`); this copy keeps the effort self-contained.
 
 Read `04-synthesis.md` first for the original port plan. Read
-`08-device-creation-reform.md` for the current provider/consumer architecture.
+`08-device-creation-reform.md` for the current provider/consumer architecture
+and `09-ticktimer-config-adjudication.md` for the accepted configurable-rate
+timer envelope.
 
 - [`00-soc-inventory.md`](00-soc-inventory.md) — CPU (VexRiscv RV32IMAC+Zkn,
   Sv32), memory map, peripheral table with base addresses, custom interrupt
@@ -35,5 +37,8 @@ Read `04-synthesis.md` first for the original port plan. Read
   standard-provider architecture for clocks, UDMA common control, IFRAM,
   IOX pinctrl/GPIO, interrupts, and multi-instance UART, with handoff invariants
   and a buildable migration sequence.
+- [`09-ticktimer-config-adjudication.md`](09-ticktimer-config-adjudication.md) —
+  adjudicates configurable timer evidence against RTL ownership proof, restores
+  two-reset takeover, and defines the conservative 100 kHz–1.25 MHz envelope.
 
 Synced from `~/a/doc/bao/` 2026-08-14.
