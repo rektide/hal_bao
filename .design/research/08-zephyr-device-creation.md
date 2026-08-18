@@ -39,13 +39,15 @@ The target is not a flat list of phandles and not a monolithic Bao resource
 manager. Each shared hardware domain becomes a deep module at an existing
 Zephyr seam:
 
-- clock control reports fixed/input clocks and owns shared gates;
-- reset control owns reset and boot-ownership transitions;
-- DMA owns UDMA channels, descriptors, event routing, and completion;
+- clock control reports inherited rates and owns shared gates for proven
+  consumers, excluding ticktimer's accepted fixed-property interface;
+- one UDMA ownership/core module owns shared reset, gates, event routing, and
+  descriptor coordination without yet claiming public reset or DMA semantics;
 - the interrupt controller owns irqarray interpretation and acknowledgment;
 - pinctrl owns pin mux and electrical state;
 - reserved-memory nodes declare static IFRAM ownership;
-- ticktimer, DUART, and UDMA UART are consumers of those providers.
+- ticktimer retains its accepted fixed `clock-frequency`; DUART and UDMA UART
+  may consume proven providers.
 
 The depth comes from hiding register offsets, synchronization, ordering,
 handoff, diagnostics, and fault accounting behind small standard interfaces.
@@ -67,8 +69,8 @@ implementation accidents as hardware description:
 - The UART driver directly modifies the shared UDMA clock gate at
   `0x50100000`, directly disables and acknowledges irqarray5 events, and embeds
   UART2-specific masks despite using instance-generation macros.
-- PB13/PB14 pinmux, UART setup, and DMA state are inherited from boot1 instead
-  of represented as an explicit handoff and normal pinctrl/DMA configuration.
+- PB13/PB14 pinmux, UART setup, and UDMA state are inherited from boot1 instead
+  of represented as an explicit handoff and normal pinctrl/core ownership.
 - Ticktimer uses a literal base-address assertion and literal flattened IRQ
   assertion. Those duplicate the DTS and interrupt encoding rather than test a
   semantic property.
@@ -94,14 +96,14 @@ third authority.
 
 | Class | Meaning | Bao examples | Authoritative locality |
 |---|---|---|---|
-| Hardware fact | Fixed by RTL or package implementation | Register windows, irqarray bank/event topology, UDMA channel capabilities, divider field widths, IFRAM boundaries | SoC `.dtsi`, bindings, DT binding headers, provider implementation |
-| SoC integration fact | How Bao hardware is represented to Zephyr | Clock/reset/DMA IDs, flattened IRQ encoding, direct-line set, provider relationships, legal DMA address domain | SoC `.dtsi` and `dt-bindings`; derived Kconfig only where Zephyr requires it |
+| Hardware fact | Fixed by RTL or package implementation | Register windows, irqarray bank/event topology, UDMA endpoint capabilities, divider field widths, IFRAM boundaries | SoC `.dtsi`, bindings, DT binding headers, provider implementation |
+| SoC integration fact | How Bao hardware is represented to Zephyr | Clock IDs, flattened IRQ encoding, direct-line set, provider relationships, legal UDMA address domain, and any later-proven reset/DMA identifiers | SoC `.dtsi` and `dt-bindings`; derived Kconfig only where Zephyr requires it |
 | Board wiring fact | What Dabao connects and reserves | PB13 RX, PB14 TX, UART2 console, PC13 boot/USB role, installed memories | Board DTS and pinctrl groups |
 | Driver policy | Mechanism choice internal to one driver | Polling strategy, lock granularity, descriptor layout, cache maintenance, retry and poll budgets, fault counters | Driver implementation and tests |
 | Application policy | Product/workload choice | Console enabled, baud request, tickless mode, runtime PM enablement, desired performance state | Application DTS overlay, Kconfig, and runtime calls |
 
 `current-speed` is a boot/default configuration request, not a hardware fact.
-The ticktimer input rate is initially an adopted fixed-clock fact. Its derived
+The ticktimer input rate is an accepted fixed DT-property fact. Its derived
 hardware-cycle and kernel-tick rates remain application policy constrained by
 the accepted safety envelope.
 
@@ -117,8 +119,9 @@ flowchart TD
 
     subgraph Providers[SoC provider modules]
         CLK[clock control]
-        RST[reset and ownership]
-        DMA[Bao UDMA controller]
+        CORE[UDMA ownership core]
+        DMAQ{public DMA feasible?}
+        RSTQ{public reset feasible?}
         IRQ[irqarray interrupt controller]
         PIN[pinctrl]
         MEM[reserved IFRAM ownership]
@@ -138,29 +141,27 @@ flowchart TD
     end
 
     BOOT --> CLK
-    BOOT --> RST
-    BOOT --> DMA
+    BOOT --> CORE
     BOOT --> PIN
     BOARD --> PIN
     BOARD --> CHOSEN
     FLASH --> BOARD
-    CLK --> TT
     CLK --> DU
-    CLK --> U2
-    RST --> DU
-    RST --> U2
-    DMA --> U2
-    DMA --> FUTURE
+    CLK --> CORE
+    CORE --> U2
+    CORE --> DMAQ
+    CORE --> RSTQ
+    DMAQ -. accepted adapter .-> FUTURE
+    DMAQ -. accepted dmas .-> U2
     IRQ --> TT
     IRQ --> U2
-    MEM --> DMA
+    MEM --> CORE
     PIN --> U2
     CHOSEN --> TT
     CHOSEN --> U2
     UARTAPI --> U2
     PM --> CLK
-    PM --> RST
-    PM --> DMA
+    PM --> CORE
 ```
 
 The provider arrows are interfaces, not MMIO reachability. Consumers never map
@@ -171,12 +172,14 @@ runtime provider call.
 
 ### Clocks
 
-Create Bao clock-control providers for fixed/input clocks and for the shared
-clock domain containing the `0x50100000` UDMA gate. The gate adapter is a child
-of one UDMA core module that owns the register block and lock together with the
-reset and DMA adapters. Use named clock IDs from a Bao DT binding header.
-Consumers receive `clocks` and `clock-names`, not `clock-frequency`, once the
-provider is available.
+Create Bao clock-control providers for inherited SYSCTRL rates and for the
+shared clock domain containing the `0x50100000` UDMA gate. The gate adapter is a
+child of one UDMA core module that owns the register block and lock together
+with common-reset exclusion and descriptor/event operations. Use named clock
+IDs from a Bao DT binding header.
+UDMA and UART consumers may receive `clocks` and `clock-names` once the provider
+is available. Ticktimer is an explicit exception: it retains the accepted fixed
+`clock-frequency` compile-time interface from the stable adjudication.
 
 Initial behavior is adopt-only:
 
@@ -188,16 +191,18 @@ Initial behavior is adopt-only:
 - PLL/divider rate changes return `-ENOTSUP` until coordinated transitions are
   designed.
 
-The UDMA core's gate, reset, and DMA child adapters share an internal
-register-update seam and lock. Consumers still see only their standard provider
-interfaces and do not learn where the bits live.
+The UDMA core's gate, common-reset observation, event, and descriptor operations
+share an internal register-update seam and lock. A clock adapter may be public;
+reset and DMA adapters remain contingent on their feasibility decisions.
 
 ### Reset and ownership
 
-Create a reset-controller provider whose IDs name reset lines, not register
-offsets. Its standard interface implements status, assert, and deassert only
-where the hardware can safely support them. A global UDMA reset must not be
-issued by a child probe.
+Stable evidence supports at most a provider-owned common UDMA reset, not a reset
+line per UART or endpoint. Treat reset topology as a feasibility gate. Until RTL
+or equivalent primary evidence proves independently controllable lines and safe
+semantics, expose no child `resets` property or per-UART reset ID. A global UDMA
+reset is an internal recovery mechanism at most and must never be issued by a
+child consumer, probe, stop operation, or ordinary PM transition.
 
 Boot ownership is stricter than reset state. Keep the ownership state machine
 inside the provider implementation:
@@ -207,37 +212,46 @@ inherited -> adopted -> quiesced -> owned -> runtime-suspended
                  \-> handoff-failed
 ```
 
-The public consumer interface remains standard reset and PM operations. The
-provider obtains handoff facts from SoC/board integration and rejects unsafe
-transitions. Do not invent a broad public `bao_claim_resource()` interface;
-that would expose ordering and make every consumer understand boot cleanup.
+The core obtains handoff facts from SoC/board integration and rejects unsafe
+transitions. A public Zephyr reset controller is allowed only after the gate
+proves actual reset lines and non-destructive ownership semantics. Do not invent
+a broad public `bao_claim_resource()` interface; that would expose ordering and
+make every consumer understand boot cleanup.
 
-### Bao UDMA controller
+### Bao UDMA ownership core
 
-Model Bao UDMA as a Zephyr DMA controller, not merely as a clock/event helper.
-This supersedes the narrower conclusion in the initial reform document. A UDMA
-channel specifier identifies a hardware request endpoint and direction, for
-example UART2 TX or UART2 RX. The DMA adapter owns:
+First model Bao UDMA as an internal ownership/core module, consistent with
+[`08-device-creation-reform.md`](08-device-creation-reform.md). It owns:
 
 - peripheral descriptor registers and their enable/clear protocol;
 - source/destination address and length validation;
 - event routing and irqarray completion association;
 - start, stop, status, and callback ordering;
-- the required clock/reset acquisition;
+- required shared-clock acquisition and common-reset exclusion;
 - IFRAM eligibility and cache maintenance rules;
 - bounded quiesce based on an elapsed-time deadline;
 - fault counters and last-failure context.
 
-The first implementation may honestly support a subset of Zephyr's DMA
-interface: one block, fixed peripheral endpoint, no scatter/gather, no cyclic
-mode, and only supported widths. Unsupported configurations return `-ENOTSUP`.
-It must still satisfy the documented semantics of `dma_config()`,
-`dma_start()`, `dma_stop()`, and `dma_get_status()` before UART migrates.
+Do not accept a generic Zephyr DMA-controller architecture from the UART case
+alone. A tracer decision must compare two implementations: (a) a conforming
+Zephyr DMA provider and (b) a narrower internal endpoint adapter used by the
+UART/protocol driver. Public `dmas` migration is blocked until endpoint/channel
+identity is proven, `dma_stop()` is non-destructive without common reset, the
+supported `dma_config()` semantics are honest, and a second real protocol
+adapter or use demonstrates that the generic seam is shared rather than a UART
+abstraction in disguise.
 
-Do not make the DMA provider allocate arbitrary IFRAM. A consumer buffer must
-either be in a referenced reserved region or pass the controller's legal-address
+If the decision accepts a Zephyr DMA provider, a DMA specifier may identify a
+channel, a request endpoint, or both, according to the actual Zephyr binding and
+driver model selected. Direction is configured through `struct dma_config`; it
+is not a DT specifier cell. No channel count is accepted by this design. If the
+narrow endpoint adapter wins, UART has no public `dmas` property and the core
+keeps descriptor/event operations private.
+
+Do not make either UDMA adapter allocate arbitrary IFRAM. A consumer buffer must
+either be in a referenced reserved region or pass the adapter's legal-address
 and coherency validation. Static console buffers remain board-owned reservations
-until a general DMA-safe allocator is demonstrated by multiple consumers.
+until a general UDMA-safe allocator is demonstrated by multiple consumers.
 
 ### Interrupt controller
 
@@ -286,10 +300,13 @@ UART2 TX/RX area is no longer a `reg` tuple on the UART.
 
 ### Ticktimer
 
-The ticktimer consumes `clocks` and its direct `interrupts` entry. Preserve the
-accepted configurable-rate interface and conservative software-only envelope
-from [`09-ticktimer-config-adjudication.md`](09-ticktimer-config-adjudication.md).
-Do not convert the accepted fixed boot-time input into runtime clock mutability.
+The ticktimer consumes its fixed `clock-frequency` property and direct
+`interrupts` entry. Preserve the accepted compile-time configurable-rate
+interface and conservative software-only envelope from
+[`09-ticktimer-config-adjudication.md`](09-ticktimer-config-adjudication.md).
+It must not migrate to `clocks` unless a future accepted decision proves
+compile-time rate guarantees and coordinated runtime semantics. A clock provider
+may serve UDMA, UART, or DUART while ticktimer remains fixed-property.
 
 Delete literal address and flattened-IRQ equality assertions. Replace them with
 semantic assertions: compatible chosen node, sufficient register window,
@@ -299,7 +316,8 @@ from hardware periods; failures expose phase and elapsed/budget information.
 
 ### DUART
 
-DUART consumes a clock and reset if those controls exist in hardware. It remains
+DUART consumes a clock if that control exists in hardware, and a reset only if a
+separate feasibility decision proves an independently safe reset line. It remains
 an honest TX-only UART adapter: `poll_in` reports no data, unsupported configure
 requests return `-ENOTSUP`, and capabilities are documented. It must not claim
 board console status merely because Verilator uses it. The simulation board or
@@ -311,17 +329,19 @@ owns that sequence under its lock; callers see only the standard UART interface.
 
 ### UDMA UART2 and other UART instances
 
-Each UDMA UART node has one UART `reg` region and standard provider properties:
-`clocks`, `resets`, `dmas`, `dma-names`, `memory-regions`,
-`memory-region-names`, `interrupts`, and `pinctrl-*`. UART2 is a board role, not
-a driver special case.
+Each UDMA UART node has one UART `reg` region plus proven properties: `clocks`,
+`memory-regions`, `memory-region-names`, `interrupts`, and `pinctrl-*`. UART2 is
+a board role, not a driver special case. It has no `resets` property under the
+current evidence. `dmas` and `dma-names` are added only if the DMA feasibility
+decision accepts a conforming public provider; otherwise the UART uses the
+internal endpoint adapter.
 
 Migration order inside the UART module is:
 
 1. polling TX/RX with standard `configure` and `config_get`;
 2. interrupt-driven behavior only if it adds a real supported mode rather than
    duplicating DMA completion callbacks;
-3. async TX using the DMA provider and standard timeout semantics;
+3. async TX using the accepted UDMA adapter and standard timeout semantics;
 4. async RX with caller buffers, replacement-buffer events, abort, and precise
    ownership transitions;
 5. optional runtime PM once suspend/resume preserves console and DMA invariants.
@@ -333,8 +353,9 @@ The setup-register encoding remains private.
 ### PM and rate policy
 
 Runtime PM is application policy enabled through standard Zephyr controls. A
-consumer runtime-suspends only after its DMA channels are stopped and its source
-is quiesced. Providers reference-count gates and preserve boot-owned users.
+consumer runtime-suspends only after its UDMA endpoints are safely stopped and
+its source is quiesced. Providers reference-count gates and preserve boot-owned
+users.
 
 No runtime clock-rate policy is approved for ticktimer or UART in this pass.
 Future rate transitions require a provider protocol that validates all active
@@ -360,7 +381,7 @@ Record the boot1 contract as explicit preconditions and provider postconditions:
 |---|---|---|
 | CPU/clocks | Boot1 selected root rates | Observe; do not reprogram globally |
 | UART2 | PB13/PB14, UART setup, and DMA may be live | Quiesce only UART2; preserve first Zephyr output |
-| UDMA | Shared gate, routes, and descriptors may contain inherited state | Preserve unrelated bits and channels |
+| UDMA | Shared gate, routes, and descriptors may contain inherited state | Preserve unrelated bits and endpoints |
 | Interrupts | CPU and bank masks/pending may contain boot state | Disable locally, classify source, clear safely, then enable |
 | IFRAM | Boot1/USB regions may remain meaningful | Do not overwrite unassigned memory |
 | PC13 | Used for PROG and USB SE0/disconnect | Preserve until explicit USB handoff |
@@ -394,8 +415,6 @@ IDs.
 
 ```dts
 #include <zephyr/dt-bindings/clock/baochip-bao1x-clock.h>
-#include <zephyr/dt-bindings/reset/baochip-bao1x-reset.h>
-#include <zephyr/dt-bindings/dma/baochip-bao1x-udma.h>
 #include <zephyr/dt-bindings/interrupt-controller/baochip-bao1x-intc.h>
 #include <zephyr/dt-bindings/pinctrl/baochip-bao1x-pinctrl.h>
 
@@ -437,23 +456,13 @@ soc {
             #clock-cells = <1>;
         };
 
-        udma_resets: reset-controller {
-            compatible = "baochip,bao1x-udma-reset";
-            #reset-cells = <1>;
-        };
-
-        udma: dma-controller {
-            compatible = "baochip,bao1x-udma";
-            #dma-cells = <2>; /* request, direction */
-            dma-controller;
-            dma-channels = <32>;
-        };
+        /* Descriptor/event and common-reset ownership remain internal. */
     };
 
     ticktimer: timer@e001b000 {
         compatible = "baochip,bao1x-ticktimer";
         reg = <0xe001b000 0x24>;
-        clocks = <&clocks BAO1X_CLK_TICKTIMER_INPUT>;
+        clock-frequency = <350000000>;
         interrupts = <BAO1X_IRQ_DIRECT(20) IRQ_TYPE_LEVEL_HIGH>;
     };
 
@@ -461,10 +470,6 @@ soc {
         compatible = "baochip,bao1x-udma-uart";
         reg = <0x50103000 0x38>;
         clocks = <&udma_clocks BAO1X_CLK_UDMA_UART2>;
-        resets = <&udma_resets BAO1X_RESET_UDMA_UART2>;
-        dmas = <&udma BAO1X_UDMA_REQ_UART2_TX DMA_MEMORY_TO_PERIPHERAL>,
-               <&udma BAO1X_UDMA_REQ_UART2_RX DMA_PERIPHERAL_TO_MEMORY>;
-        dma-names = "tx", "rx";
         memory-regions = <&uart2_dma>;
         memory-region-names = "dma";
         interrupts = <BAO1X_IRQ_EVENT(5, 8) IRQ_TYPE_EDGE_RISING>,
@@ -481,20 +486,12 @@ soc {
 
 The exact UART event IDs must be verified against RTL/SVD before implementation;
 the sketch intentionally does not bless the current broad `GENMASK(11, 8)` as
-the UART interface.
+the UART interface. A later accepted DMA-provider variant may add `dmas`, where
+`#dma-cells` identifies a channel, request endpoint, or both as required by the
+actual Zephyr binding. Direction remains in `dma_config`, and this document does
+not select a cell count or hardware channel count.
 
 ## Binding and interface sketches
-
-```yaml
-# baochip,bao1x-udma.yaml
-compatible: "baochip,bao1x-udma"
-include: dma-controller.yaml
-properties:
-  "#dma-cells": { const: 2 }
-dma-cells:
-  - request
-  - direction
-```
 
 ```yaml
 # baochip,bao1x-udma-uart.yaml
@@ -502,22 +499,20 @@ compatible: "baochip,bao1x-udma-uart"
 include:
   - uart-controller.yaml
   - pinctrl-device.yaml
-  - reset-device.yaml
   - memory-region.yaml
 properties:
   reg: { required: true }
   clocks: { required: true }
-  resets: { required: true }
-  dmas: { required: true }
-  dma-names: { required: true }
   memory-regions: { required: true }
   memory-region-names: { required: true }
   interrupts: { required: true }
   interrupt-names: { required: true }
 ```
 
-The binding should constrain names to `tx`/`rx`, require one UART register
-range, and reject legacy `tx_buffer`, `control`, and `irqarray` register names.
+The binding should constrain interrupt names to `tx`/`rx`, require one UART
+register range, and reject legacy `tx_buffer`, `control`, and `irqarray`
+register names. Conditional `dmas` names belong only to a later accepted
+DMA-provider binding.
 
 Provider implementation interfaces remain standard Zephyr calls. Bao-specific
 headers contain IDs and generated-spec convenience only:
@@ -525,8 +520,6 @@ headers contain IDs and generated-spec convenience only:
 ```c
 /* Public: stable topology names, no offsets. */
 #define BAO1X_CLK_UDMA_UART2 ...
-#define BAO1X_RESET_UDMA_UART2 ...
-#define BAO1X_UDMA_REQ_UART2_TX ...
 #define BAO1X_IRQ_UART2_TX BAO1X_IRQ_EVENT(5, ...)
 
 /* Private to provider implementation and tests. */
@@ -560,8 +553,9 @@ alignment constraints, ownership state, error codes, and fault observations.
 
 | Proposal | Depth assessment | Decision |
 |---|---|---|
-| Named clock/reset/DMA/IRQ/pin constants in DT binding headers | Deepens interfaces by replacing magic topology with stable semantic names | Build now |
-| Binding macros that derive channel/IRQ limits from one formula | Removes duplicated `NUM_IRQS` and instance arithmetic while improving diagnostics | Build now |
+| Named clock/IRQ/pin constants in DT binding headers | Deepens proven interfaces by replacing magic topology with stable semantic names | Build now |
+| Reset IDs or DMA request/channel IDs | Useful only after their feasibility decisions prove the represented hardware and API semantics | Gate |
+| Binding macros that derive IRQ limits from one formula | Removes duplicated `NUM_IRQS` arithmetic while improving diagnostics | Build now |
 | Generated DTS/linker/UF2 consistency checks | Concentrates metadata drift detection at the build seam | Build now |
 | Reusable private fake-MMIO adapter with scripted time | Exercises provider interfaces, ordering, races, and timeout behavior without exposing registers to consumers | Build now |
 | Provider fault snapshot and counters | Makes bounded failures observable without logging from tight/early paths | Build now, small fixed schema |
@@ -577,7 +571,7 @@ violated invariant. Examples:
 
 ```text
 uart2: DMA region uart2_dma overlaps boot-owned IFRAM
-uart2: TX DMA request is not memory-to-peripheral
+uart2: UDMA TX endpoint cannot be stopped without affecting another endpoint
 ticktimer: interrupt must be a legal Bao direct line
 bao1x-intc: CONFIG_NUM_IRQS=368 does not match derived IRQ limit 368
 dabao: chosen code partition start differs from boot1 entry contract
@@ -592,27 +586,30 @@ failure.
 
 ## Decision records
 
-### DR-1: Standard providers over a Bao resource manager
+### DR-1: Proven standard providers over a Bao resource manager
 
-**Accepted.** Standard seams maximize reuse and upstream comprehensibility.
-Shared-register coordination stays in provider implementations.
+**Accepted.** Standard seams maximize reuse and upstream comprehensibility when
+their semantics are proven. Shared-register coordination stays in provider
+implementations; UDMA remains internal until DR-7 selects its seam.
 
-### DR-2: UDMA is a DMA controller
+### DR-2: UDMA begins as an internal ownership core
 
-**Accepted with conformance gate.** Implement the supported subset of the
-standard DMA interface and reject unsupported modes. Do not migrate UART merely
-after creating a binding; first prove configure/start/stop/status and callback
-semantics through provider tests.
+**Accepted.** This reconciles with the evidence limit in
+[`08-device-creation-reform.md`](08-device-creation-reform.md): shared gates,
+events, descriptors, and common reset do not establish a generic DMA engine.
+Public DMA architecture remains undecided pending DR-7.
 
 ### DR-3: Static IFRAM ownership before allocation
 
 **Accepted.** Reserved-memory metadata and explicit references precede any
 allocator. Unknown boot/USB regions stay reserved.
 
-### DR-4: Adopt-only clocks and resets first
+### DR-4: Adopt-only clocks; reset exposure gated
 
-**Accepted.** Probe observes inherited configuration. Narrow gate/reset changes
-occur only for an explicitly owned child. Runtime rate changes remain rejected.
+**Accepted.** Probe observes inherited configuration and clock operations
+preserve unrelated bits. Stable evidence does not prove a per-UART reset line.
+Common UDMA reset remains provider-owned and unavailable to children. Public
+reset control requires a positive topology and semantics decision.
 
 ### DR-5: Consumer-local interrupt semantics
 
@@ -625,26 +622,55 @@ controller support and generated equivalence checks.
 region and entry ABI, and UF2 tooling owns delivery format. Build validation
 connects them without collapsing them into one bespoke metadata file.
 
+### DR-7: Decide public DMA only after a comparative tracer
+
+**Open feasibility decision.** Compare (a) a conforming Zephyr DMA provider and
+(b) a narrower internal endpoint adapter. Accept the public provider only if:
+
+- endpoint/channel identity maps honestly to a Zephyr DMA specifier;
+- direction remains in `dma_config`, not in the DT specifier;
+- configure/start/status/callback behavior satisfies the supported Zephyr
+  contract and unsupported modes fail explicitly;
+- `dma_stop()` stops one endpoint without common reset, collateral channel
+  effects, or corruption of inherited work; and
+- a second real adapter or use validates the abstraction and ownership seam.
+
+Otherwise accept the internal endpoint adapter and keep `dmas` out of consumer
+bindings. Either outcome must retain address/coherency validation, bounded
+quiesce, unrelated-bit tests, and fault observations.
+
+### DR-8: Ticktimer retains fixed `clock-frequency`
+
+**Accepted by reconciliation.** The stable
+[`09-ticktimer-config-adjudication.md`](09-ticktimer-config-adjudication.md)
+requires a fixed compile-time DT input. UDMA/UART clock-provider work does not
+alter that interface. Ticktimer can migrate to `clocks` only through a future
+accepted decision with compile-time rate guarantees and coordinated runtime
+semantics.
+
 ## Open questions
 
 1. Which exact UDMA UART events correspond to RX completion, TX completion,
    error, and validity, and which are edge versus level in RTL?
-2. Can all supported UDMA channels satisfy Zephyr `dma_stop()` without a global
-   reset, including inherited busy descriptors?
-3. Does hardware distinguish peripheral reset lines, or must UART ownership be
-   implemented without reset while the global UDMA reset remains unavailable?
-4. Which IFRAM ranges remain live or security-sensitive after boot1 jumps, and
+2. Does a conforming Zephyr DMA provider or a narrower internal endpoint adapter
+   best represent UDMA after testing endpoint identity and non-destructive stop?
+3. Can every proposed public DMA endpoint satisfy Zephyr `dma_stop()` without a
+   common reset, including inherited busy descriptors and concurrent users?
+4. Is there primary evidence for any independently controllable peripheral
+   reset line, or must all child ownership operate without reset while common
+   UDMA reset remains unavailable?
+5. Which IFRAM ranges remain live or security-sensitive after boot1 jumps, and
    when does USB relinquish each range?
-5. Are PB13/PB14 electrical settings fully represented in IOX data, and what
+6. Are PB13/PB14 electrical settings fully represented in IOX data, and what
    sleep state preserves recovery and avoids line glitches?
-6. Should console polling use a statically reserved DMA byte indefinitely, or
+7. Should console polling use a statically reserved UDMA byte indefinitely, or
    transition to the same queued async path after kernel initialization?
-7. Can `CONFIG_NUM_IRQS` be derived from generated DT at its Kconfig evaluation
+8. Can `CONFIG_NUM_IRQS` be derived from generated DT at its Kconfig evaluation
    point, or is a shared-header equality check the least duplicated solution?
-8. Which Zephyr fixed-partition/chosen-code-partition shape works with the
+9. Which Zephyr fixed-partition/chosen-code-partition shape works with the
    memory-mapped RRAM model without falsely claiming a writable flash driver?
-9. What fault status exists for UDMA invalid addresses, and can it identify the
-   failing channel without destructive reads?
+10. What fault status exists for UDMA invalid addresses, and can it identify the
+   failing endpoint without destructive reads?
 
 ## Tracer sequence
 
@@ -655,24 +681,27 @@ and include the acceptance evidence listed here.
 | ID | Domain tracer | Acceptance | Depends on |
 |---|---|---|---|
 | T0 | Contract fixtures | Native fixtures express boot state, shared-gate preservation, IRQ modes, IFRAM map, and current generated metadata without changing production behavior | none |
-| T1 | Shared identifiers and validation | Named line/clock/reset/DMA/pin constants compile; one derived IRQ-limit formula is checked against `NUM_IRQS`; current DTS/linker/UF2 values pass drift checks | T0 |
-| T2 | Clock provider | Fixed/input rates and shared UDMA gates use clock control; probe writes nothing; concurrent gate users preserve each other; ticktimer and DUART can consume clocks | T1 |
-| T3 | Reset/ownership provider | Adopt/quiesce/own failure states are tested; child operations never issue global UDMA reset; boot-owned state is preserved | T1 |
+| T1 | Shared identifiers and validation | Named proven clock/IRQ/pin constants compile; one derived IRQ-limit formula is checked against `NUM_IRQS`; current DTS/linker/UF2 values pass drift checks; no speculative reset/DMA IDs | T0 |
+| T2 | Clock provider | Shared UDMA gates use clock control; probe writes nothing; concurrent gate users preserve each other; UART/DUART adoption can be tested while ticktimer retains fixed `clock-frequency` | T1 |
+| T3 | UDMA ownership core | Adopt/quiesce/own failure states and locked gate/event/descriptor operations are tested; children never issue common UDMA reset; boot-owned state is preserved; no public reset or DMA claim | T1 |
 | T4 | IFRAM ownership | SoC banks and board reservations validate containment/non-overlap; boot/USB unknown ranges remain reserved; no UART binding change yet | T1 |
-| T5 | UDMA provider core | Standard DMA subset passes fake-MMIO configure/start/stop/status, invalid-address, busy handoff, timeout, and unrelated-bit tests | T2, T3, T4 |
+| T5 | UDMA adapter feasibility decision | Comparative tracer implements enough of conforming Zephyr DMA and narrow endpoint variants to test endpoint identity, config direction, non-destructive stop, inherited/concurrent work, callbacks, errors, and a second real use; records one accepted interface | T2, T3, T4 |
 | T6 | irqarray semantic specifiers | Two-cell interrupts, direct-line validation, generated old-mask equivalence, edge/level race tests, and no consumer direct MMIO | T1 |
-| T7 | IOX pinctrl and Dabao states | PB13/PB14 default/sleep states apply without touching PC13 or adjacent pins; board validation catches conflicts | T1, T3 |
-| T8 | Ticktimer/DUART cleanup | Both consume clocks; literal address/IRQ assertions are gone; accepted timer envelope remains; DUART config_get is honest | T2, T6 |
-| T9 | UART2 polling migration | UART has one `reg`; consumes clock/reset/DMA/memory/interrupt/pinctrl; first and normal console bytes survive; no raw irqarray/shared-gate access remains | T5, T6, T7 |
+| T7 | IOX pinctrl and Dabao states | PB13/PB14 default/sleep states apply without touching PC13 or adjacent pins; board validation catches conflicts | T1 |
+| T8 | Ticktimer/DUART cleanup | Ticktimer keeps fixed `clock-frequency` and its accepted envelope; literal address/IRQ assertions are gone; DUART may consume the proven clock provider and `config_get` is honest | T2, T6 |
+| T9 | UART2 polling migration | UART has one `reg`; consumes clock/memory/interrupt/pinctrl and the T5-selected internal or public UDMA interface; has no child reset; first and normal console bytes survive; no raw irqarray/shared-gate access remains | T5, T6, T7 |
 | T10 | UART standard configuration | `configure`/`config_get` round-trip supported formats/rates and reject unsupported ones; setup literal remains private | T9 |
-| T11 | UART async TX/RX | DMA callbacks, timeouts, aborts, buffer ownership, and interrupt ordering satisfy standard UART async events | T10 |
-| T12 | Runtime PM adoption | Suspend/resume quiesces DMA, applies pin states, reference-counts gates, and preserves chosen-console policy; runtime rate change remains rejected | T11 |
+| T11 | UART async TX/RX | Accepted UDMA-adapter callbacks, timeouts, aborts, buffer ownership, and interrupt ordering satisfy standard UART async events | T10 |
+| T12 | Runtime PM adoption | Suspend/resume quiesces the accepted UDMA adapter without common reset, applies pin states, reference-counts gates, and preserves chosen-console policy; runtime rate change remains rejected | T11 |
 | T13 | Flash/boot metadata locality | Fixed partition, linker entry, signer input, UF2 family, and board documentation have one authority each and generated consistency checks | T1 |
 | T14 | Hardware handoff validation | Dabao evidence records first-byte continuity, PB13/PB14 state, PC13 preservation, adjacent IFRAM canaries, unrelated UDMA state, timer cadence, and recoverability | T8, T9, T13 |
 
-Dependency edges are explicit: `T5` depends on `T2/T3/T4`; `T9` depends on
-`T5/T6/T7`; `T11` depends on `T10`; `T14` depends on `T8/T9/T13`. A provider
-binding without provider behavior does not unblock its consumer.
+Dependency edges are explicit: `T2`, `T3`, and `T4` proceed without public DMA
+or reset; `T5` depends on all three and decides the UDMA adapter; `T9` depends on
+the accepted T5 result plus `T6/T7`; `T11` depends on `T10`; `T14` depends on
+`T8/T9/T13`. A speculative reset binding or DMA binding does not unblock a
+consumer. Public `dmas` migration occurs only when T5 positively selects the
+conforming provider; no current tracer requires public reset exposure.
 
 ## Recommended next implementation pass
 
@@ -682,17 +711,19 @@ several agents working at domain seams with little file overlap.
 | Priority | Agent lane | Deliverable | Integration gate |
 |---:|---|---|---|
 | 1 | Contract and diagnostics | T0 fixtures plus private fake-MMIO/time adapter and fault snapshot conventions | Existing behavior represented; no production path changed |
-| 2 | Identifiers and metadata | T1 named constants, IRQ-limit derivation, DTS/linker/UF2 drift checks | Pristine positive and intentionally broken negative builds |
-| 3 | Clock/reset | T2 and T3 provider bindings, adopt-only implementations, shared-register and ownership tests | Probe-write trace empty; unrelated bits preserved |
+| 2 | Identifiers and metadata | T1 proven clock/IRQ/pin constants, IRQ-limit derivation, DTS/linker/UF2 drift checks | Pristine positive and intentionally broken negative builds; no reset/DMA IDs |
+| 3 | Clock/shared ownership | T2 clock provider plus T3 internal UDMA ownership core, adopt-only implementations, shared-register tests | Probe-write trace empty; unrelated bits preserved; common reset unreachable by children |
 | 4 | Memory | T4 IFRAM inventory, reserved-memory nodes, overlap/containment validation | Current boot/USB ranges conservative and UART reservation explicit |
 | 5 | Interrupts | T6 semantic specifier prototype and old-mask equivalence tests | RTL-derived edge/level tests pass; no consumer migration yet |
 | 6 | Pinctrl | T7 IOX provider seam and Dabao PB13/PB14 states | PC13 and neighboring pins unchanged in scripted and hardware snapshots |
-| 7 | UDMA | T5 standard DMA subset on fake MMIO, initially not selected by UART | DMA conformance subset and inherited-busy failure behavior pass |
-| 8 | Synthesis/integration | Reconcile provider IDs, init dependencies, diagnostics, and DTS sketch; prepare T8/T9 implementation brief | All providers coexist in a build with legacy UART still operational |
+| 7 | UDMA decision | T5 comparative public-DMA versus internal-endpoint tracer, including non-destructive stop and a second adapter/use | One interface accepted with evidence; public `dmas` remains absent unless all DR-7 gates pass |
+| 8 | Synthesis/integration | Reconcile proven clock/core interfaces, init dependencies, diagnostics, and DTS sketch; prepare T8 and conditional T9 briefs | Provider-first pieces coexist with legacy UART; no dependency on unproven reset/DMA interfaces |
 
-Do not parallelize UART migration with an unproven DMA provider. Agents may
-develop fixtures and bindings concurrently, but T9 starts only after the
-integration gate proves the final provider interfaces.
+Do not parallelize UART migration with an undecided UDMA adapter. Agents may
+develop fixtures, clock/shared-ownership, reserved-memory, interrupt, and
+pinctrl work concurrently. Do not create public reset/DMA bindings in those
+lanes. T9 starts only after T5 records the accepted adapter and the integration
+gate proves it alongside the provider-first work.
 
 ## Recommended entry points
 
@@ -703,12 +734,13 @@ integration gate proves the final provider interfaces.
 3. Inspect current `bao1x.dtsi`, `uart_baochip_udma.c`, and the UDMA UART binding
    together; their coupling is the first concrete seam to remove.
 4. Implement T0/T1 before selecting provider compatible names or changing DTS.
-5. Use the provider-domain lanes above, then integrate at T5/T6/T7 before T9.
+5. Use the provider-domain lanes above, decide the UDMA seam at T5, then
+   integrate T5/T6/T7 before T9.
 
 ## Cross-references
 
-- [`/.design/research/08-device-creation-reform.md`](/.design/research/08-device-creation-reform.md) is the completed initial audit and establishes adopt-only ownership, static IFRAM, pin preservation, and the rejection of raw provider-register phandles. This design broadens it and supersedes its conclusion that UDMA common control should not become a DMA controller.
-- [`/.design/research/09-ticktimer-config-adjudication.md`](/.design/research/09-ticktimer-config-adjudication.md) defines the accepted fixed-input configurable-rate envelope, two-reset takeover proof, and derived bounded polling that the clock migration must preserve.
+- [`/.design/research/08-device-creation-reform.md`](/.design/research/08-device-creation-reform.md) is the completed initial audit and establishes adopt-only ownership, static IFRAM, pin preservation, and the evidence limit that UDMA common control is not itself proof of a generic DMA engine. This design preserves that limit and adds a comparative feasibility decision rather than superseding it.
+- [`/.design/research/09-ticktimer-config-adjudication.md`](/.design/research/09-ticktimer-config-adjudication.md) is the stable decision defining the fixed `clock-frequency` compile-time interface, configurable-rate envelope, two-reset takeover proof, and derived bounded polling. This design preserves that interface; unrelated clock-provider work does not migrate ticktimer.
 - [`/.design/research/06-irq-ack-semantics.md`](/.design/research/06-irq-ack-semantics.md) supplies the RTL-proven edge pre-ack, level post-ack, direct-line bypass, and race tests required by T6.
 - [`/.design/research/05-lifecycle-delivery-validation.md`](/.design/research/05-lifecycle-delivery-validation.md) distinguishes observed boot/hardware evidence from inferred ownership and defines device recovery constraints.
 - [`/.design/research/01-boot-delivery.md`](/.design/research/01-boot-delivery.md) records the boot1 entry contract, signed image shape, baremetal address envelope, and UF2 constants used by T13.
@@ -718,22 +750,24 @@ integration gate proves the final provider interfaces.
 - [`Zephyr DMA controller binding`](https://github.com/zephyrproject-rtos/zephyr/blob/main/dts/bindings/dma/dma-controller.yaml) defines standard channel, request, mask, and alignment metadata.
 - [`Zephyr UART interface`](https://github.com/zephyrproject-rtos/zephyr/blob/main/include/zephyr/drivers/uart.h) defines configuration, polling, interrupt, and async buffer/event semantics for the staged UART evolution.
 - [`Zephyr clock-control interface`](https://github.com/zephyrproject-rtos/zephyr/blob/main/include/zephyr/drivers/clock_control.h) and [`clock controller binding`](https://github.com/zephyrproject-rtos/zephyr/blob/main/dts/bindings/clock/clock-controller.yaml) define the standard clock seam.
-- [`Zephyr reset interface`](https://github.com/zephyrproject-rtos/zephyr/blob/main/include/zephyr/drivers/reset.h) and [`reset controller binding`](https://github.com/zephyrproject-rtos/zephyr/blob/main/dts/bindings/reset/reset-controller.yaml) define the narrow reset seam; Bao ownership sequencing remains behind it.
+- [`Zephyr reset interface`](https://github.com/zephyrproject-rtos/zephyr/blob/main/include/zephyr/drivers/reset.h) and [`reset controller binding`](https://github.com/zephyrproject-rtos/zephyr/blob/main/dts/bindings/reset/reset-controller.yaml) define the narrow seam against which a future positive reset-feasibility decision must be tested; they are not evidence of Bao per-child lines.
 - [`Zephyr pinctrl interface`](https://github.com/zephyrproject-rtos/zephyr/blob/main/include/zephyr/drivers/pinctrl.h) and [`pinctrl binding`](https://github.com/zephyrproject-rtos/zephyr/blob/main/dts/bindings/pinctrl/pinctrl-device.yaml) define consumer states without exposing IOX registers.
 - [`Xous Bao UDMA implementation`](https://github.com/betrusted-io/xous-core/blob/5d5bbbfa95c0dcef26fe1fe9b496b7f6f31d191b/libs/bao1x-hal/src/udma/mod.rs#L46-L160) is primary integration evidence for shared gate, reset, and event routing behavior, not a Zephyr interface precedent.
 - [`Xous UDMA UART implementation`](https://github.com/betrusted-io/xous-core/blob/5d5bbbfa95c0dcef26fe1fe9b496b7f6f31d191b/libs/bao1x-hal/src/udma/uart.rs) is primary evidence for descriptor and setup behavior that must be verified against RTL before assigning standard DMA capabilities.
 
 ## Doc-pass record
 
-The documentation tree was searched by provider, ownership, boot handoff,
+The documentation tree was searched by provider, ownership, reset topology, DMA
+endpoint semantics, boot handoff,
 interrupt semantics, timer configuration, console, flash, linker, and UF2
 concepts. The substantive relationships are linked above. The initial reform
-document remains useful as the audit record; this design is the broader target
-entry point. The research README is updated only to route readers to both and
-to identify this document as the follow-up architecture.
+document remains the evidence boundary for UDMA common control; this design is
+the broader conditional target model. The stable ticktimer adjudication remains
+authoritative for its fixed compile-time clock interface.
 
 Notable absences remain explicit open work: there is no accepted IFRAM ownership
-map after boot1, no UDMA DMA-interface conformance proof, no IOX pinctrl design,
+map after boot1, no per-child reset topology, no accepted public DMA adapter or
+non-destructive `dma_stop()` proof, no second adapter/use, no IOX pinctrl design,
 and no single generated source for boot partition/linker/UF2 consistency. Those
-absences are not implementation claims and should not be papered over by DTS
+absences are not implementation claims and must not be papered over by DTS
 properties.

@@ -39,8 +39,8 @@ timer envelope.
   IOX pinctrl/GPIO, interrupts, and multi-instance UART, with handoff invariants
   and a buildable migration sequence.
 - [`08-zephyr-device-creation.md`](08-zephyr-device-creation.md) - follow-up
-  domain model for clock/reset/DMA/interrupt/pinctrl providers, consumer and
-  boot policy locality, target DTS/bindings, diagnostics, and tracer sequence.
+  domain model for proven providers and an internal UDMA ownership core, with
+  reset/DMA feasibility gates, consumer and boot locality, and tracer sequence.
 - [`09-ticktimer-config-adjudication.md`](09-ticktimer-config-adjudication.md) —
   adjudicates configurable timer evidence against RTL ownership proof, restores
   two-reset takeover, and defines the conservative 100 kHz–1.25 MHz envelope.
