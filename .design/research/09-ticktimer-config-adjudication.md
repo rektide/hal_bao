@@ -15,6 +15,9 @@ sources:
   - id: zephyr-configurable-tests
     resource: urn:git:commit:9f1bb96cb066b79458919e4943afee7749b35ec4
     title: Local Zephyr configurable ticktimer tests
+  - id: baochip-takeover-prototype
+    resource: file:/tmp/opencode/baochip-timer-takeover-prototype/RESULTS.md
+    title: Throwaway takeover prototype measurements on Zephyr tip ce6cae8e5c19
 ---
 
 # Baochip ticktimer configuration adjudication
@@ -27,6 +30,13 @@ configuration interface, chosen-node selection, exact arithmetic diagnostics,
 and reusable tests. Replace their three-distinct-sample takeover with the
 two-reset sequence below and limit configurations to the conservative
 software-only envelope defined here.
+
+> **Revision, 2026-08-19:** the two-reset observe-zero takeover accepted
+> below is falsified by measured prototype evidence; the accepted proof is
+> now the cadence measurement, and the envelope inequalities are re-derived.
+> See the
+> [Addendum 2026-08-19](#addendum-2026-08-19-cadence-proof-replaces-the-falsified-observe-zero-takeover)
+> at the end of this document. The public interface is unchanged.
 
 This decision covers boot-time adoption of the Baochip 1x ticktimer as Zephyr's
 system timer with a fixed input clock. It does not approve runtime input-rate or
@@ -277,8 +287,275 @@ test passes.
 
 ## Cross-references
 
-- [`07-ticktimer-sysclock.md`](07-ticktimer-sysclock.md) supplies the accepted two-reset epoch proof, bounded coherent reads, alarm sequencing, and original 1 MHz evidence; this adjudication generalizes only its rate envelope.
+- [`07-ticktimer-sysclock.md`](07-ticktimer-sysclock.md) supplies bounded coherent reads, alarm sequencing, and the original 1 MHz evidence; its two-reset epoch proof is falsified by the 2026-08-19 addendum, which supersedes that takeover with the cadence measurement.
 - [`08-device-creation-reform.md`](08-device-creation-reform.md) establishes fixed-rate clock-provider ownership and the distinction between a synchronization visibility proof and a software poll bound; this adjudication replaces its fixed-1-MHz limitation with explicit conservative inequalities.
 - [`06-irq-ack-semantics.md`](06-irq-ack-semantics.md) defines the direct interrupt path used after takeover and separates it from irqarray acknowledgment semantics.
 - [`05-lifecycle-delivery-validation.md`](05-lifecycle-delivery-validation.md) explains why observed simulator or hardware handoff evidence must remain distinct from inferred ownership.
 - [`04-synthesis.md`](04-synthesis.md) is the original milestone decision selecting the ticktimer as the system clock.
+
+# Addendum 2026-08-19: cadence proof replaces the falsified observe-zero takeover
+
+## Why this revision exists
+
+The takeover accepted above — two reset requests separated by a coherent
+nonzero observation and completed by a coherent zero observation — has been
+tested against the integrated RTL model and falsified. A throwaway Zephyr
+prototype (isolated copy of Zephyr tip `ce6cae8e5c19`, prepared `Vsim`
+SHA-256 `c24080fe64b663feaa15ab2afa547886aeeaa938250d3b6f8088267f16a443d2`,
+three deterministic reruns per configuration) never observed reset zero
+under any deadline, `CONTROL` write sequence, or inter-write delay it tried.
+The same prototype then implemented a cadence-based takeover and measured it
+at all three supported rates; that proof is accepted here in the observe-zero
+proof's place. The public interface and the conservative rate envelope are
+unchanged. The envelope inequalities are re-derived below; one is retired as
+an operative constraint.
+
+## Claims and adjudication
+
+| Claim | Evidence | Counterargument | Adjudication | Confidence |
+|---|---|---|---|---|
+| The two-reset nonzero-to-zero sequence proves a new epoch (accepted in the table above). | Variants A–D kept the accepted sequence and varied only deadlines, shared and separate, up to 524,288 mcycles per phase: the first reset yields coherent `TIME=1` promptly (~238–262 mcycles, one poll, three `TIME` reads), but zero is never observed — variant D exhausted 4,294 coherent polls, 12,882 `TIME` reads, and 523,889 mcycles with `TIME` advanced to 1,497. Variants E–I (`CONTROL=0` re-arm before pulsing, inter-write waits through 131,072 mcycles, explicit `0`/`RESET`/`0` triplets, distinct-value priming) all timed out at coherent `TIME=187` after 65,181 mcycles and 543 polls. | Deadline starvation and write-strobe gating are excluded: the RTL strobes `CONTROL` on every write regardless of stored value, `reset_xfer_blind` suppresses a request only until its acknowledgment returns, and the post-request trajectory is invariant across a 16x delay range — consistent with accepted resets followed by resumed counting. | **Reject — falsified.** Reset zeroes the timer-domain counter only transiently; software reads a separately synchronized snapshot whose free-running refresh skips intermediate values, so the transient zero is not software-visible at any `P`. The original `P >= 280` visibility rationale is wrong, not merely tight. | High |
+| A bounded cadence measurement proves divider-rate ownership and establishes the driver baseline. | Measured mcycles per `TIME` increment: 349.69 vs 350 (−0.089%), 3492.8 vs 3500 (−0.206%), 279.00 vs 280 (−0.357%) at 1 MHz, 100 kHz, and 1.25 MHz; zero run-to-run spread across three deterministic reruns per configuration; deadline completed at 48.9–49.5% of budget in every configuration; first alarm punctual (below). | Cadence certifies the stored reload and therefore the rate; it cannot certify the absolute epoch of `TIME` — whether the counter was ever zeroed is unobservable through the snapshot synchronizer. | **Accept.** The epoch is unobservable and unneeded: the driver consumes only deltas. The baseline is the final measured `TIME`; alarm targets and elapsed/announce arithmetic are differences from that baseline. Rate ownership plus a relative baseline is exactly the contract the system-clock driver consumes. | High |
+| `mcycle` is a valid elapsed-time reference for takeover deadlines and test assertions. | Empirically `TIME` advanced 41,267 while `mcycle` advanced 105,793 across a 40 ms sleep: the RTL gates the core clock during WFI and `CsrPlugin_mcycle` counts only core clocks, while the timer domain never gates. | None, provided the reference interval busy-polls, which the takeover does. | **Accept as a platform constraint, not a takeover claim.** Any `mcycle`-based assertion must use a busy-poll reference, never sleep-spanning deltas. | High |
+| The envelope inequalities above remain operative unchanged. | All three supported rates pass; 10 MHz remains excluded. | Their reset-visibility rationale is falsified: `P >= 280` no longer purchases an observable zero, and `P + 286 <= 4096` no longer bounds a two-phase reset poll that cannot succeed. | **Split — re-derived below.** `P >= 280` survives with a new rationale; `P + 286 <= 4096` is retired as an operative constraint while the slow-rate envelope edge is retained conservatively; `C * P >= P + 140` survives for alarm margin. | High |
+
+## Falsification evidence
+
+| Group | What varied | Nonzero phase | Zero phase |
+|---|---|---|---|
+| A–D | shared vs separate deadlines, 636 (`P + 286`) to 524,288 mcycles per phase | coherent `TIME=1` on the first poll, 238–262 mcycles, three `TIME` reads | never zero; variant D: 4,294 coherent polls, 12,882 reads, 523,889 mcycles, `TIME` = 1,497 |
+| E–I | `CONTROL=0` re-arm, waits through 131,072 mcycles, explicit `0`/`RESET`/`0` pulsing, distinct-value priming (artifacts `S1`–`S5`, `W8192`–`W131072`) | coherent `TIME=1` (or `TIME=3`) on the first poll | never zero; 543 coherent polls, 1,629 reads, 65,181 mcycles, `TIME` = 187, invariant across all variants |
+
+Long zero-phase polling cost about 122.0 mcycles per coherent poll and 40.7
+mcycles per `TIME` MMIO read, so the loops sampled several times per
+synchronizer refresh period and still never sampled the transient. The root
+cause is observability, not deadlines or write strobes:
+
+- `cram_axi.sv:16185-16194` decodes the `CONTROL` write and strobes on every
+  write, with no comparison against the stored value; `16268-16274` turns the
+  strobe plus stored bit into the one-cycle `ticktimer_reset` request.
+- `cram_axi.sv:12681-12685` admits a request only while `reset_xfer_blind`
+  is clear; `19982-19991` sets blind on request and clears it on the returned
+  acknowledgment (`19914-19916`). Pending requests are suppressed until
+  acknowledged, not lost.
+- `cram_axi.sv:19864-19883` shows an accepted request resetting
+  `ticktimer_timer0`, reloading the prescaler, and immediately resuming
+  counting: the timer-domain zero lasts less than one divider period.
+- `cram_axi.sv:12645-12649` exposes the separately synchronized
+  `ticktimer_timer_sync_o` as `TIME` rather than `timer0`; the snapshot is
+  refreshed by a free-running ping-pong handshake with a 128-count cadence
+  (`12669-12674`, `19891-19906`, `19961`) that drops intermediate values —
+  including the transient reset zero.
+
+Therefore no poll budget, write spacing, or `CONTROL` value sequence can make
+reset zero software-visible on this RTL. The two-reset contract's zero phase
+is unsatisfiable, which falsifies the sequence as a whole even though its
+nonzero phase and its fences remain sound.
+
+## Accepted takeover: cadence measurement
+
+```text
+EV_ENABLE = 0
+full data-synchronization fence
+CLOCKS_PER_TICK = P - 1
+full data-synchronization fence
+CONTROL = RESET                     # single request; blind is clear at issue
+full data-synchronization fence
+
+read coherent high-low-high TIME samples, each stamped with mcycle
+discard one anchor sample plus two changed observations
+    (one possible stale synchronized payload, one old-divider expiration)
+mark start TIME and start mcycle
+sample until the unsigned 64-bit TIME delta is at least 64 increments
+    post-loop sanity: TIME delta <= 128, else fail with -EILSEQ
+expected mcycle delta = TIME_delta * CPU_CLOCK_HZ
+                         / CONFIG_SYS_CLOCK_HW_CYCLES_PER_SEC
+accept when |measured - expected| is within tolerance
+baseline last_count = final TIME
+program the first alarm at last_count + CYC_PER_TICK
+```
+
+The single wait is bounded by one mcycle deadline taken before the reset
+write: `2 * window + 128 + (P + 286)` mcycles, where
+`window = 64 * CPU_CLOCK_HZ / CONFIG_SYS_CLOCK_HW_CYCLES_PER_SEC`. The
+128-mcycle term covers the measured ~122-mcycle coherent poll; `P + 286` is
+the retained CDC allowance for reset-request acknowledgment and synchronized
+`TIME` refresh. All arithmetic is 64-bit with compile-time asserted products;
+mcycle deltas use 32-bit unsigned subtraction, so a 32-bit `mcycle` wrap is
+safe.
+
+Measured results (three deterministic reruns per configuration,
+bit-identical telemetry):
+
+| Configuration | `P` | deadline (mcycles) | ratio measured vs expected | error | polls | deadline used |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 MHz / 1 kHz | 350 | 45,564 | 349.69 vs 350 | −0.089% | 89 | 48.9–49.5% |
+| 100 kHz / 100 Hz | 3500 | 451,914 | 3492.8 vs 3500 | −0.206% | 879 | 48.9–49.5% |
+| 1.25 MHz / 1.25 kHz | 280 | 36,534 | 279.00 vs 280 | −0.357% | 72 | 48.9–49.5% |
+
+- Run-to-run spread is zero in every configuration; rebuilt 1 percent
+  tolerance confirmations also passed (`K1n`–`K3n`), with errors −0.464%,
+  −0.178%, and +0.089%.
+- The build-to-build envelope is −0.464%…+0.089%, consistent with one
+  synchronizer refresh (~300 mcycles) plus one poll (~254 mcycles) over the
+  17,920–224,000-mcycle windows: endpoint quantization, not period error,
+  dominates.
+- Production tolerance must cover that envelope with margin: 5 percent is
+  comfortable; 1 percent is already build-phase sensitive at `P = 280`.
+- The required discard count was exactly two changed observations in every
+  run. The ~254-mcycle poll cadence (three MMIO reads plus loop and deadline
+  checks) stayed below `P`, so no increment was skipped between polls and
+  every window closed with `TIME` delta exactly 64.
+- Takeover completed at 48.9–49.5 percent of the deadline (about 2.03x
+  margin), leaving the second half of the budget for a slow inherited
+  expiration or acknowledgment delay.
+- First-alarm punctuality: the 40 ms test sleep ended at 41.3 ms (1 MHz) and
+  40.9 ms (1.25 MHz); the 100 kHz case returned after five 10 ms tick
+  boundaries instead of four — a tickless announce-alignment artifact of the
+  missed init alarm at that rate, not a cadence error.
+
+## RTL ownership argument
+
+- The prescaler reloads from live register storage at expiry:
+  `ticktimer_clkspertick = ticktimer_clocks_per_tick_storage`
+  (`cram_axi.sv:12663`) with reload-on-zero at `19871-19874`. A
+  `CLOCKS_PER_TICK` write updates storage immediately and never reloads the
+  prescaler (the only immediate reload is the suspend/resume LOAD request,
+  `5598` and `16153-16155`), so the inherited count expires at most once
+  under the old reload — the hardware-reset default is 800,000 input cycles
+  (`20676`) — and that single expiration is exactly what the discard rule
+  removes.
+- After the discards, the 64-increment window spans full periods of whatever
+  reload value is stored. A wrong stored reload `P'` appears as a ratio of
+  `P'/P`; the measured ratios certify the stored reload within tolerance,
+  and the stored reload is what software wrote. The new divider therefore
+  owns the counter's rate.
+- A single reset request issued with `reset_xfer_blind` clear cannot be
+  coalesced (`cram_axi.sv:16268-16274`, `12681-12685`, `19982-19991`); it
+  zeroes `timer0` and reloads the prescaler in the timer domain
+  (`19860-19883`). Coalescing requires a second request before the
+  acknowledgment returns, which this sequence never issues.
+- A lost or delayed request cannot corrupt the measurement: the divider
+  write alone retimes the counter from the next expiration, so the cadence
+  proof survives a lost reset; the loss only postpones the first increment,
+  which the deadline detects and fails safe.
+- What cadence cannot prove is the absolute epoch of `TIME`. It does not
+  need to: `TIME` is consumed only through deltas (baseline, alarm targets,
+  and elapsed/announce arithmetic are all differences). The snapshot
+  refresh's skip behavior is precisely why the epoch is unobservable — the
+  same fact that falsified observe-zero.
+- The `mcycle` reference is valid because the measurement busy-polls: the
+  core clock cannot gate without WFI, while the `TIME` domain never gates.
+
+## Platform constraint: WFI gates the core clock
+
+- `vexsys.sv:124` gates the VexRiscv core clock through an ICG when
+  `wfi_active`; the sleep request is `cram_axi.sv:5213`
+  (`wfi & cpu_int_active & ~axi_active & active_timeout==0`), with
+  `cpu_int_active` true only while no interrupt is pending
+  (`cram_axi.sv:16663`). `CsrPlugin_mcycle` increments only on core clocks
+  (`VexRiscv_CramSoC.sv:7857`). The ticktimer lives in the always-on domain.
+- Empirically, across a 40 ms sleep, `TIME` advanced 41,267 while `mcycle`
+  advanced 105,793 — roughly 99.2 percent of the sleep was clock-gated.
+- Consequence for tests and drivers: any `mcycle`-based assertion must use a
+  busy-poll reference, never a sleep-spanning delta. The standard timer
+  test's independent-reference assertion (`main.c:91`) compares
+  `k_cycle_get_64()` progress against `mcycle` across `k_sleep()` and cannot
+  pass under this gating; fixing it is a test-side or platform-side change,
+  not a takeover change. No takeover acceptance may be gated on
+  `PROJECT EXECUTION SUCCESSFUL` until that assertion is repaired.
+
+## Envelope re-derivation: which inequalities survive
+
+The original constants remain RTL facts where cited, but their roles change:
+
+- **`P >= 280` — survives, new rationale.** Its reset-zero-visibility
+  rationale is falsified: zero is not observable at any `P`. It survives as
+  the conservative boundary of the measured cadence evidence: the measured
+  poll cost (~122 mcycles per coherent poll uninstrumented; ~254 mcycles
+  with mcycle stamping and deadline checks) must stay below one increment
+  period `P` so increments are not skipped between polls and the discard
+  accounting stays exact, and every cadence measurement, tolerance, and
+  margin recorded above was taken inside it. At `P = 280` only ~26 cycles —
+  about one tenth of a poll — separate the cadence from the boundary, which
+  is why the 1 percent rebuild moved +0.089% there.
+- **`P + 286 <= 4096` — retired as an operative constraint.** It bounded a
+  two-phase reset-observation poll that cannot succeed. The cadence deadline
+  `2 * window + 128 + (P + 286)` mcycles is self-bounding — linear in `P` —
+  and completed at no more than 49.5 percent of budget at every supported
+  rate. The `P + 286` term survives inside that deadline as the CDC
+  allowance for reset acknowledgment and synchronized `TIME` refresh. The
+  ~70 kHz slow-rate rejection is retained only because no runtime evidence
+  exists below 100 kHz; widening downward is a new decision, not an
+  entitlement of the cadence proof.
+- **`C * P >= P + 140` — survives for alarm margin, re-derived.** It never
+  depended on reset observability: it requires one kernel tick to contain
+  one full divider period plus a CDC allowance so the first alarm target can
+  commit, transfer, and be compared against a refreshed `TIME`. The
+  falsification sharpened rather than removed this need: the measured CDC
+  path costs (one `TIME` refresh ~300 mcycles; one coherent poll ~254
+  mcycles) exceed the nominal 140-cycle payload-visibility allowance, so 140
+  is a floor, not a sufficient margin. The operative alarm safety remains
+  the two-tick absolute retry margin plus the three-commit bound with the
+  expired-level fallback from [`07-ticktimer-sysclock.md`](07-ticktimer-sysclock.md);
+  the measured first-alarm punctuality above is empirical support, not
+  proof. `C = 1` still fails trivially.
+- **10 MHz (`P = 35`) remains rejected** without invoking reset visibility:
+  endpoint quantization alone is about (300 + 254) / (64 × 35) ≈ 25 percent,
+  five times a 5 percent tolerance, and the ~254-mcycle poll cadence exceeds
+  seven increment periods, so the loop could not even observe the individual
+  changes the discard rule counts.
+
+## Scope preserved, and explicit non-widening
+
+- The public interface is unchanged: fixed DT `clock-frequency`,
+  `zephyr,system-timer` selection, `CONFIG_SYS_CLOCK_HW_CYCLES_PER_SEC`,
+  `CONFIG_SYS_CLOCK_TICKS_PER_SEC`, `CONFIG_TICKLESS_KERNEL`; exact
+  divisibility, nonzero, and reload-fit checks; runtime updates unsupported.
+- The supported envelope stays 100 kHz–1.25 MHz at the 350 MHz input. This
+  addendum does not widen rates. The cadence proof's structure — rate
+  certified by ratio, deadline linear in the window, epoch not required —
+  may permit future widening (for example toward 10 MHz), but only through a
+  new decision backed by new runtime evidence covering tolerance at smaller
+  `P`, discard accounting with skipped increments, and alarm margin at the
+  faster rate.
+- The production implementation is still pending: this addendum adjudicates
+  the proof, it does not ship the driver. The production takeover must
+  replace both observe-zero loops with the cadence measurement above, keep
+  the bounded diagnostics, and repair or replace the test's
+  `mcycle`-across-sleep assertion before any acceptance is gated on
+  `PROJECT EXECUTION SUCCESSFUL`.
+
+## Process rule applied to this revision
+
+The falsification is the standing rule — empirical PASS does not supersede an
+unresolved proof obligation — operating in both directions. The prior
+acceptance rested on an RTL argument (reset-zero residence `P` containing
+two 140-cycle visibility bounds) that treated the `BusSynchronizer`
+payload-visibility bound as if intermediate destination values were exposed;
+the snapshot refresh skips them, and no measurement had been taken. This
+revision therefore labels its own basis: the adjudication above rests on
+prototype measurements from one deterministic simulator build (three reruns
+per configuration, one configuration family) plus the RTL line-cited
+arguments reproduced here. The production driver, its diagnostics, native
+and Verilator tests, and hardware validation remain open obligations, and
+the cadence PASS recorded here does not close them.
+
+One reconciliation item is open: the fixed-rate `PROJECT EXECUTION
+SUCCESSFUL` records preserved in `07-ticktimer-sysclock.md` predate the
+prepared simulator build used here and are not explained by this prototype;
+they must no longer be cited as zero-observability evidence, and tracing how
+their zero phase completed (a different simulator build or timing) is an
+open documentation task.
+
+## References for this addendum
+
+- Prototype results (throwaway, outside any repository):
+  `/tmp/opencode/baochip-timer-takeover-prototype/RESULTS.md`, with artifacts
+  under `A/`–`D/`, `S1/`–`S5/`, `W8192`–`W131072/`, `K1/`–`K3/`, and
+  `K1n/`–`K3n/`; Zephyr tip `ce6cae8e5c19` isolated copy; prepared `Vsim`
+  SHA-256 `c24080fe64b663feaa15ab2afa547886aeeaa938250d3b6f8088267f16a443d2`.
+- [`cram_axi.sv`](https://github.com/baochip/baochip-1x/blob/83b220f790e7e846a6500264b480b42ad9ebd40b/rtl/modules/vexriscv/rtl/cram_axi.sv) — `CONTROL` strobe (`16185-16194`), reset request (`16268-16274`), blind admission/acknowledgment (`12681-12685`, `19914-19916`, `19982-19991`), timer reset and reload (`19860-19883`), prescaler storage reload (`12663`, `19871-19874`), synchronized `TIME` exposure and refresh (`12645-12674`, `19891-19906`, `19961`), WFI request and gating (`5213`, `16663`), divider default (`20676`), suspend/resume load (`5598`, `16153-16155`).
+- [`vexsys.sv`](https://github.com/baochip/baochip-1x/blob/83b220f790e7e846a6500264b480b42ad9ebd40b/rtl/modules/core/rtl/vexsys.sv) — core-clock ICG during WFI (`124`).
+- [`VexRiscv_CramSoC.sv`](https://github.com/baochip/baochip-1x/blob/83b220f790e7e846a6500264b480b42ad9ebd40b/rtl/modules/vexriscv/lib/VexRiscv_CramSoC.sv) — `CsrPlugin_mcycle` increments on core clocks (`7857`).
+- [`07-ticktimer-sysclock.md`](07-ticktimer-sysclock.md) — bounded coherent reads, alarm-commit retry and fallback, and the original (now falsified) two-reset text.
