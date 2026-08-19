@@ -24,6 +24,9 @@ sources:
   - id: zephyr-baochip-runtime-overlay
     resource: urn:git:commit:69c8bd9e46b27b25a785a1a44c767fc244a46b80
     title: Local Zephyr runtime-test overlay routing output through DUART
+  - id: zephyr-baochip-cadence-production
+    resource: urn:git:commit:94e8b16af9c2af52537b9f9c0fe90a9243cee3ba
+    title: Local Zephyr cadence-takeover production series, 818c2606 through 94e8b16a
 ---
 
 # Baochip ticktimer system clock contract
@@ -106,6 +109,20 @@ from the new `CLOCKS_PER_TICK`
 `BlindTransfer` suppresses another source pulse until the destination pulse has
 been acknowledged
 ([`cdc.py:140-177`](https://github.com/baochip/baochip-1x/blob/83b220f790e7e846a6500264b480b42ad9ebd40b/rtl/scripts/headergen/migen/genlib/cdc.py#L140-L177)).
+
+> **Correction, 2026-08-19:** The two-reset sequence below and its
+> nonzero-to-zero argument are superseded by the accepted cadence-measurement
+> takeover defined in the
+> [Addendum 2026-08-19](/.design/research/09-ticktimer-config-adjudication.md#addendum-2026-08-19-cadence-proof-replaces-the-falsified-observe-zero-takeover)
+> to [`/.design/research/09-ticktimer-config-adjudication.md`](/.design/research/09-ticktimer-config-adjudication.md):
+> one reset request; one anchor sample plus two changed observations
+> discarded; a 64-increment `TIME` window measured against `mcycle`; a
+> tolerance of at least 5 percent; and a baseline of the final measured
+> `TIME`. Reset zero is transient in the timer domain and never
+> software-visible, so the zero phase cannot succeed. The sequence is retained
+> for the record; the coherent-read and alarm-commit machinery elsewhere in
+> this note remains in force.
+
 The implemented takeover is therefore bounded and deliberately uses two reset
 pulses:
 
@@ -163,6 +180,9 @@ CDC timing or multiple high-epoch advances during this short function. The
 read uses only MMIO samples and local variables: it needs no software lock,
 atomic operation, or mutable cross-call state. Takeover still accepts only a
 result marked coherent when proving the nonzero-to-zero reset sequence.
+*(Superseded 2026-08-19: the nonzero-to-zero purpose is withdrawn — the
+cadence measurement accepts only coherent samples but never observes zero;
+see the 09 addendum.)*
 
 Program a target high word first and low word last. RTL makes only the low-word
 write assert `msleep_target_re`, which starts transfer and temporarily locks out
@@ -222,6 +242,11 @@ relationship to `CONFIG_SYS_CLOCK_HW_CYCLES_PER_SEC`, so they must not be
 preserved as Zephyr cycles.
 
 Initialization must order ownership and the first alarm as follows:
+
+> **Correction, 2026-08-19:** Steps 3–4 are superseded by the cadence
+> measurement — a single reset request, followed by the bounded measured-rate
+> check, with the baseline set to the final measured `TIME` rather than zero
+> (see the 09 addendum). Steps 1–2 and 5–7 remain the accepted ordering.
 
 ```text
 1. EV_ENABLE = 0.
@@ -311,6 +336,22 @@ remain; only exhaustion deliberately enables the already-high comparator.
 
 ## Implementation and runtime status
 
+> **Correction, 2026-08-19:** The fixed-1 MHz Verilator `PASS` records
+> preserved in this section (and the corresponding validation-matrix row
+> below) predate the prepared simulator build used to falsify observe-zero
+> and are not explained by it. Per the
+> [09 addendum](/.design/research/09-ticktimer-config-adjudication.md#addendum-2026-08-19-cadence-proof-replaces-the-falsified-observe-zero-takeover)
+> they must no longer be cited as zero-observability evidence, and tracing how
+> their zero phase completed is an open documentation task.
+
+> **Update, 2026-08-19:** The production cadence-takeover implementation now
+> exists in the local Zephyr tree — `818c2606c208` (replace two-reset takeover
+> with cadence measurement helper), `2ad51a082fdb` (adopt cadence takeover and
+> re-derived envelope gates), `ec6d4fce4f2a` and `f72773e4b668` (cadence
+> gathered against a busy-polled `mcycle` reference), and `94e8b16af9c2`
+> (binding matched to the cadence envelope) — with runtime SUCCESS at 1 MHz
+> (tickless and periodic), 100 kHz/100 Hz, and 1.25 MHz/1.25 kHz.
+
 The implementation is in the local Zephyr tree through commit `5238ced66f59`,
 with runtime overlay `69c8bd9e46b2`:
 
@@ -371,7 +412,7 @@ algorithms for those synthetic cases, not their physical incidence.
 |---|---|
 | Build | Dabao builds in tickless and `CONFIG_TICKLESS_KERNEL=n` configurations; devicetree reports base, size, frequency, and IRQ 356; no CLINT/machine-timer driver is linked. |
 | Unit/native logic | Divider calculation yields 349; `CYC_PER_TICK` is 1000; all formulas use counter cycles; target split is high then low; counter reads and alarm commits stop after three attempts; tests cover coherent reads, rollover retry, conservative floor and unsigned-wrap fallbacks, absolute two-tick-margin retries, final expired-target fallback, zero/one/maximum timeouts, late ISR, and elapsed-before-rearm. |
-| Verilator, observed | Tickless and periodic images each emit `PROJECT EXECUTION SUCCESSFUL`; the sole ztest passes in 0.019 s. Its assertions establish a 12 ms `k_sleep()` deadline, uptime and 32/64-bit cycle progression, and timer wakeup preemption. Build artifacts link the sole system timer's direct ISR at IRQ 356, and successful timer-dependent completion establishes that it fires. |
+| Verilator, observed | Tickless and periodic images each emit `PROJECT EXECUTION SUCCESSFUL`; the sole ztest passes in 0.019 s. Its assertions establish a 12 ms `k_sleep()` deadline, uptime and 32/64-bit cycle progression, and timer wakeup preemption. Build artifacts link the sole system timer's direct ISR at IRQ 356, and successful timer-dependent completion establishes that it fires. *(2026-08-19: no longer citable as zero-observability evidence; see the correction above.)* |
 | Verilator, still open | Inject CDC faults; force `TIME0` rollover during high-low-high reads; force three consecutive alarm-commit expiries and observe the level-IRQ fallback; verify exact divide-by-350 cadence, target-transfer/W1C edge cases, delayed-ISR catch-up, and sustained interrupt load independently of the nominal kernel test. |
 | Hardware, still open | Confirm monotonic cycles/uptime and direct IRQ behavior on silicon; measure long-interval uptime/sleep drift; cover one- and many-tick sleeps, tickless idle, periodic interrupt load, `TIME0` rollover, CDC behavior, and clock-policy assumptions. |
 
@@ -397,6 +438,17 @@ algorithms for those synthetic cases, not their physical incidence.
 - Suspend/resume through `susres` is outside M2. The counter is in the
   always-on domain, but Zephyr power-management integration needs separate
   validation before claiming deep-sleep timekeeping.
+- **Platform constraint (added 2026-08-19):** WFI gates the VexRiscv core
+  clock through an ICG
+  ([`vexsys.sv:124`](https://github.com/baochip/baochip-1x/blob/83b220f790e7e846a6500264b480b42ad9ebd40b/rtl/modules/core/rtl/vexsys.sv#L124)),
+  and `CsrPlugin_mcycle` counts only core clocks
+  ([`VexRiscv_CramSoC.sv:7857`](https://github.com/baochip/baochip-1x/blob/83b220f790e7e846a6500264b480b42ad9ebd40b/rtl/modules/vexriscv/lib/VexRiscv_CramSoC.sv#L7857)),
+  while the ticktimer's always-on domain never gates. Measured across a 40 ms
+  sleep, `TIME` advanced 41,267 while `mcycle` advanced 105,793 (~99.2 percent
+  of the sleep clock-gated). Any `mcycle`-based assertion must use a
+  busy-poll reference, never a sleep-spanning delta; the cadence measurement
+  busy-polls, so its `mcycle` deadline is valid, but `k_cycle_get_64()`
+  versus `mcycle` comparisons across `k_sleep()` are not.
 
 ## Cross-references
 
