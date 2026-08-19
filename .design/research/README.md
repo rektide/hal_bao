@@ -42,7 +42,9 @@ timer envelope.
   domain model for proven providers and an internal UDMA ownership core, with
   reset/DMA feasibility gates, consumer and boot locality, and tracer sequence.
 - [`09-ticktimer-config-adjudication.md`](09-ticktimer-config-adjudication.md) —
-  adjudicates configurable timer evidence against RTL ownership proof, restores
-  two-reset takeover, and defines the conservative 100 kHz–1.25 MHz envelope.
+  adjudicates configurable timer evidence against RTL ownership proof and
+  defines the conservative 100 kHz–1.25 MHz envelope; its 2026-08-19 addendum
+  falsifies the two-reset observe-zero takeover and accepts a measured cadence
+  proof with a relative baseline.
 
 Synced from `~/a/doc/bao/` 2026-08-14.

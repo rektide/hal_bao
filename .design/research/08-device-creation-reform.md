@@ -157,7 +157,7 @@ than pretending that their register ownership is disjoint.
 | IOX mux/electrical fields | Pinctrl states | Pinctrl and GPIO under one per-pin lock | Apply only explicitly selected pins | Bank-wide defaults; touching PC13 implicitly |
 | IOX GPIO direction/data | GPIO controller | GPIO under the same per-pin lock | Operate requested GPIO pins | Overwrite mux/electrical fields raced with pinctrl |
 | irqarray trigger and pending policy | Interrupt specifiers interpreted by controller | Interrupt controller | Program disabled child, clear stale pending, then enable | Binding-only flags; consumer writes to irqarray MMIO |
-| Ticktimer divider/reset/alarm | Timer node consumes a clock | Chosen system timer, within the current fixed-rate envelope | Adopt clock rate, program divider, prove reset epoch, arm bounded alarm | Runtime rate change without divider/reset acknowledgment |
+| Ticktimer divider/reset/alarm | Timer node consumes a clock | Chosen system timer, within the current fixed-rate envelope | Adopt clock rate, program divider, prove rate ownership by the accepted cadence measurement, arm bounded alarm | Runtime rate change without divider/reset acknowledgment |
 | PC13 / USB SE0 | Board pin state and boot handoff invariant | USB/board handoff policy, not generic GPIO probe | Preserve until USB explicitly relinquishes it | GPIO/pinctrl defaults that release or drive it unintentionally |
 
 ## Clock and system-timer exemplar
@@ -197,11 +197,20 @@ visible and it must not be presented as a CDC timing guarantee. Likewise, the
 two-tick alarm margin protects deadline transfer and recheck; it does not repair
 an unobservable reset pulse.
 
+> **Correction, 2026-08-19:** The paragraph above is falsified by measurement:
+> reset zero is transient in the timer domain, and the synchronized `TIME`
+> snapshot path skips intermediate values, so the zero phase never succeeds
+> under any deadline or write sequence. The accepted takeover is now the
+> bounded cadence measurement defined in the 2026-08-19 addendum to
+> [`/.design/research/09-ticktimer-config-adjudication.md`](/.design/research/09-ticktimer-config-adjudication.md).
+> The 140-cycle visibility number remains an RTL fact about payload
+> visibility; it is no longer the basis of any reset-observation proof.
+
 Therefore an adopt-only provider may report the inherited 350 MHz rate, and the
 timer may retain its validated 349 reload. An unrestricted, higher-rate, or
-runtime-changeable clock invalidates the proof when the reset-zero interval
-approaches the 140-cycle visibility bound or when the rate changes under timer
-accounting. Such support requires one of:
+runtime-changeable clock invalidates the accepted cadence proof when endpoint
+quantization approaches the measurement tolerance or when the rate changes
+under timer accounting. Such support requires one of:
 
 - explicit divider/reset acknowledgment that proves the destination applied
   the new divider and reset, independent of sampling a transient zero; or
@@ -218,7 +227,7 @@ initialization diagnostics should be exact and actionable:
 | Hardware cycles do not divide evenly to kernel ticks | `CONFIG_SYS_CLOCK_HW_CYCLES_PER_SEC must divide exactly by CONFIG_SYS_CLOCK_TICKS_PER_SEC` |
 | Clock provider reports a rate outside the validated envelope | `Baochip ticktimer supports only a fixed 350000000 Hz input until divider/reset acknowledgement exists` |
 | Nonzero phase exhausts its bounded poll budget | `Baochip ticktimer takeover timed out waiting for synchronized nonzero TIME` |
-| Reset-zero phase exhausts its bounded poll budget | `Baochip ticktimer takeover timed out waiting for synchronized reset-zero TIME` |
+| Takeover cadence measurement exhausts its deadline or misses the accepted tolerance | `Baochip ticktimer takeover cadence measurement timed out` / `Baochip ticktimer measured divider cadence outside tolerance` (replaces the falsified reset-zero phase diagnostic; see the 2026-08-19 addendum to the ticktimer adjudication) |
 | Three alarm commits expire | Do not fail: enable the final expired level target and count/report `alarm_commit_exhausted` in test diagnostics |
 
 Compile-time assertions remain appropriate when the rate is a DT constant;
@@ -305,8 +314,10 @@ bridges live only within a commit series and are removed when that domain's
 consumer migrates.
 
 1. **Timer: enforce the validated clock envelope.** Add exact compile/runtime
-   diagnostics, codify the 140-cycle visibility requirement, and extend native
-   tests. No DT topology change.
+   diagnostics, codify the envelope from the 2026-08-19 cadence-measurement
+   addendum to
+   [`/.design/research/09-ticktimer-config-adjudication.md`](/.design/research/09-ticktimer-config-adjudication.md),
+   and extend native tests. No DT topology change.
 2. **Memory: describe IFRAM ownership.** Add disabled-by-default IFRAM memory
    and `/reserved-memory` nodes, board-owned UART/USB reservations, schema
    checks, and overlap tests. Keep the UART's old region mapping until commit 4.
@@ -336,7 +347,7 @@ consumer migrates.
 | Domain | Schema assertions | Native/unit tests | Verilator integration | Hardware evidence |
 |---|---|---|---|---|
 | SYSCTRL clock | Valid clock IDs; consumers use `clocks`; no writable policy properties | Decode inherited rates/state; reject set-rate/gate/reset | Timer and UART obtain expected 350/100 MHz rates without register changes | Pre/post SYSCTRL snapshot unchanged through probe |
-| Ticktimer | One chosen timer; clock reference; direct IRQ | 350-cycle zero window exceeds 140-cycle visibility bound; exact divide checks; both timeout diagnostics; three-attempt read/alarm bounds | Tickless and periodic sleep/preemption; forced poll timeout; alarm exhaustion fallback | Monotonic 32/64-bit cycles, drift, reset takeover, direct IRQ |
+| Ticktimer | One chosen timer; clock reference; direct IRQ | Divider cadence within the accepted tolerance; exact divide checks; cadence deadline/tolerance diagnostics; three-attempt read/alarm bounds | Tickless and periodic sleep/preemption; forced poll timeout; alarm exhaustion fallback | Monotonic 32/64-bit cycles, drift, takeover cadence, direct IRQ |
 | UDMA common | Child gate/event/reset specifiers in range | Concurrent per-bit updates preserve unrelated bits; probe writes nothing; no global reset | UART0/2 synthetic enable order and independent state | UART2 output continues; unrelated boot-owned UDMA state unchanged |
 | IFRAM | Reservations are aligned, non-overlapping, and inside IFRAM; references required | Generated-address/size checks | UART descriptor accesses only assigned page | USB/boot1 buffers remain intact; canary adjacent pages |
 | IOX pinctrl/GPIO | Valid port/pin/function and no duplicate exclusive claims | Concurrent pinctrl/GPIO updates preserve fields and neighboring pins; PC13 denied/reserved | UART2 pin state plus unrelated GPIO operation | PB13/PB14 console works; PC13 USB SE0 behavior unchanged |
@@ -353,9 +364,12 @@ consumer migrates.
 - **False clock confidence:** replacing a numeric rate with a clock phandle does
   not prove the rate or permit changing it. Adopt-only semantics must be stated
   in binding, driver, and tests.
-- **Timer takeover failure:** a divider yielding a zero interval too short for
-  the 140-cycle visibility path breaks the current nonzero-to-zero proof even
-  with a large poll loop. Reject it until acknowledgment exists.
+- **Timer takeover failure:** the nonzero-to-zero proof is falsified for
+  every rate (2026-08-19 addendum to
+  [`/.design/research/09-ticktimer-config-adjudication.md`](/.design/research/09-ticktimer-config-adjudication.md));
+  a too-fast divider now fails the accepted cadence measurement because
+  endpoint quantization scales with the refresh and poll costs. Reject it
+  until runtime evidence widens the envelope.
 - **IFRAM overlap:** reservation mistakes can corrupt USB rings or boot state
   before console output exists. Assert non-overlap and preserve unknown ranges.
 - **PC13 release:** generic pin defaults can change PROG/USB disconnect and make
@@ -382,9 +396,11 @@ These are preconditions and postconditions, not implementation suggestions:
 6. PC13's level, direction, mux, and electrical configuration are preserved
    through generic pinctrl/GPIO initialization; only the eventual USB owner may
    deliberately change SE0 behavior.
-7. Ticktimer input remains fixed at 350 MHz while its 1 MHz epoch is active.
-   The divider is 349, the 350-cycle reset-zero window exceeds the 140-cycle
-   visibility bound, and takeover/alarm loops remain bounded.
+7. Ticktimer input remains fixed at 350 MHz while its 1 MHz rate is active.
+   The divider is 349, takeover is the bounded cadence measurement accepted in
+   the 2026-08-19 addendum to
+   [`/.design/research/09-ticktimer-config-adjudication.md`](/.design/research/09-ticktimer-config-adjudication.md),
+   and takeover/alarm loops remain bounded.
 8. Direct IRQs never traverse irqarray MMIO. A level ISR deasserts its source
    before W1C; an edge source is pre-acknowledged according to the established
    controller contract.
@@ -453,7 +469,7 @@ legacy path in the same domain's buildable sequence.
 
 ## Cross-references
 
-- [`/.design/research/09-ticktimer-config-adjudication.md`](/.design/research/09-ticktimer-config-adjudication.md) - resolves the later configurable-rate implementation against this document's CDC/ownership constraints and replaces the fixed-1-MHz limitation with explicit conservative bounds.
+- [`/.design/research/09-ticktimer-config-adjudication.md`](/.design/research/09-ticktimer-config-adjudication.md) - resolves the later configurable-rate implementation against this document's CDC/ownership constraints and replaces the fixed-1-MHz limitation with explicit conservative bounds; its 2026-08-19 addendum falsifies the observe-zero takeover and accepts a cadence measurement, superseding this document's reset-zero visibility rationale.
 - [`/.design/research/06-irq-ack-semantics.md`](/.design/research/06-irq-ack-semantics.md) - defines edge-versus-level acknowledgment order, direct-line bypass, trigger priority, and the controller tests that interrupt flags must drive.
 - [`/.design/research/07-ticktimer-sysclock.md`](/.design/research/07-ticktimer-sysclock.md) - supplies the divider/reset takeover, bounded coherent reads, alarm margin, direct IRQ, and existing tickless/periodic evidence narrowed here to a fixed-rate clock envelope.
 - [`/.design/research/05-lifecycle-delivery-validation.md`](/.design/research/05-lifecycle-delivery-validation.md) - establishes boot1 transport ownership, physical UART2 observability, lifecycle constraints, and why a successful handoff must be observed rather than inferred.

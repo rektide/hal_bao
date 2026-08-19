@@ -46,6 +46,19 @@ Verilator model. Hardware validation remains open.
 > next deadline through `sys_clock_set_timeout()` in both tickless and periodic
 > configurations.
 
+> **Correction, 2026-08-19:** The two-reset takeover below — coherent nonzero
+> after the first reset, then a synchronized zero after the second — is
+> falsified by measurement on the integrated RTL model: reset zero is
+> transient in the timer domain, and the synchronized `TIME` snapshot path
+> skips intermediate values, so the zero is never software-visible under any
+> deadline or write sequence tried. The accepted takeover is now the cadence
+> measurement defined in the 2026-08-19 addendum to
+> [`/.design/research/09-ticktimer-config-adjudication.md`](/.design/research/09-ticktimer-config-adjudication.md):
+> one reset request, a bounded measured-rate check, and a baseline of the
+> final measured `TIME` (the zero epoch is neither observable nor needed).
+> This note's coherent-read, alarm-commit, bounded-poll, and direct-IRQ
+> machinery remain in force; its zero-epoch assertions do not.
+
 ## Hardware contract
 
 The block has nine 32-bit registers. Offsets and fields agree with generated
@@ -377,14 +390,17 @@ algorithms for those synthetic cases, not their physical incidence.
   reprogramming runs again.
 - Reprogramming `CLOCKS_PER_TICK` does not reset the current prescaler. The
   required reset after divider programming is what establishes the exact first
-  1 MHz counter interval and the trustworthy zero epoch.
+  1 MHz counter interval; the trustworthy zero epoch it was also claimed to
+  establish is falsified and replaced by the cadence-measured baseline (see
+  the 2026-08-19 addendum to
+  [`/.design/research/09-ticktimer-config-adjudication.md`](/.design/research/09-ticktimer-config-adjudication.md)).
 - Suspend/resume through `susres` is outside M2. The counter is in the
   always-on domain, but Zephyr power-management integration needs separate
   validation before claiming deep-sleep timekeeping.
 
 ## Cross-references
 
-- [`/.design/research/09-ticktimer-config-adjudication.md`](/.design/research/09-ticktimer-config-adjudication.md) - supersedes the fixed-1-MHz support boundary, preserves this document's two-reset ownership proof, and defines the accepted conservative configurable-rate envelope.
+- [`/.design/research/09-ticktimer-config-adjudication.md`](/.design/research/09-ticktimer-config-adjudication.md) - supersedes the fixed-1-MHz support boundary and defines the accepted conservative configurable-rate envelope; its 2026-08-19 addendum falsifies this document's two-reset observe-zero takeover and accepts a cadence-measurement proof with a relative baseline instead.
 - [`/.design/research/00-soc-inventory.md`](/.design/research/00-soc-inventory.md) - SoC clock tree, ticktimer placement, and direct CPU line inventory.
 - [`/.design/research/04-synthesis.md`](/.design/research/04-synthesis.md) - milestone decision selecting ticktimer as the M2 system clock.
 - [`/.design/research/06-irq-ack-semantics.md`](/.design/research/06-irq-ack-semantics.md) - flattened interrupt model and the distinction between direct lines and irqarray children.
