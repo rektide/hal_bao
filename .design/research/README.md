@@ -4,6 +4,10 @@ The wave-0 research corpus behind the port. Written independently by four
 agents, synthesized in `04-synthesis.md`. The durable home for these is the
 shared doc repo (`~/a/doc/bao/`); this copy keeps the effort self-contained.
 
+For current physical-board status and operator procedure, start with the
+[`bring-up index`](../bringup/index.md). This research directory preserves the
+detailed rationale and historical decisions; it is not the current runbook.
+
 Read `04-synthesis.md` first for the original port plan. Read
 `08-device-creation-reform.md` for the completed device audit,
 `08-zephyr-device-creation.md` for the broader provider/consumer target model,
